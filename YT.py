@@ -369,6 +369,55 @@ def tts_chunks_and_srt(script_text: str, temp_dir: Path, lang: str = "en") -> Tu
     return final_audio, srt_path, srt_entries
 
 
+def _pillow_title_clip(title_text: str, width: int, height: int, duration: float = 3.0,
+                       bg_color=(20, 20, 20), font_color=(255, 255, 255)):
+    # Pillow-rendered title frame, returned as a MoviePy ImageClip
+    try:
+        font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", 96)
+    except Exception:
+        try:
+            font_title = ImageFont.truetype("DejaVuSans.ttf", 96)
+        except Exception:
+            font_title = ImageFont.load_default()
+
+    img = Image.new("RGB", (width, height), color=bg_color)
+    draw = ImageDraw.Draw(img)
+
+    max_text_width = width - 160
+    words = (title_text or "").split()
+    lines = []
+    current = ""
+    for w in words:
+        test = (current + " " + w).strip()
+        if draw.textlength(test, font=font_title) <= max_text_width:
+            current = test
+        else:
+            if current:
+                lines.append(current)
+            current = w
+    if current:
+        lines.append(current)
+
+    line_height = (font_title.size or 60) + 10
+    total_text_height = max(line_height, len(lines) * line_height)
+    y = (height - total_text_height) // 2
+
+    for line in lines[:5]:
+        tw = draw.textlength(line, font=font_title)
+        draw.text(((width - tw) / 2, y), line, font=font_title, fill=font_color)
+        y += line_height
+
+    return ImageClip(np.array(img)).set_duration(duration)
+
+
+
+
+
+
+
+
+
+
 # -------------------------
 # Video assembly (MoviePy)
 # -------------------------
