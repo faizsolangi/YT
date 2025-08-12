@@ -5,3 +5,4 @@ pillow
 moviepy
 requests
 python-dotenv
+gtts
