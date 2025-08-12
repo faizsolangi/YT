@@ -13,6 +13,8 @@ from moviepy.video.VideoClip import TextClip, ImageClip
 from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip, concatenate_videoclips
 from moviepy.audio.io.AudioFileClip import AudioFileClip
 from moviepy.video.fx.Resize import Resize as vfx_resize
+from moviepy.video.fx.resize import resize as vfx_resize
+from moviepy.video.fx.crop import crop as vfx_crop
 from moviepy.audio.AudioClip import CompositeAudioClip, AudioClip as BaseAudioClip, AudioArrayClip
 import numpy as np
 import traceback
@@ -461,16 +463,16 @@ def build_video_from_script_and_images(
 
         # Resize preserving aspect to cover, then center crop to 1080p
         if clip.w / clip.h >= W / H:
-            clip = clip.resize(height=H)
+            clip = vfx_resize(clip, height=H)
         else:
-            clip = clip.resize(width=W)
+            clip = vfx_resize(clip, width=W)
         x_center = int((clip.w - W) // 2)
         y_center = int((clip.h - H) // 2)
-        clip = clip.crop(x1=x_center, y1=y_center, x2=x_center + W, y2=y_center + H)
+        clip = vfx_crop(clip, x1=x_center, y1=y_center, x2=x_center + W, y2=y_center + H)
 
         # Subtle Ken Burns zoom (use method API, not vfx import)
         try:
-            clip = clip.resize(lambda t: 1.0 + 0.02 * (t / max(0.001, per_clip)))
+            clip = vfx_resize(clip, lambda t: 1.0 + 0.02 * (t / max(0.001, per_clip)))
         except Exception:
             pass
 
