@@ -1,95 +1,655 @@
-# youtube_automation_app.py
 import os
+import tempfile
+import time
+import re
+from pathlib import Path
+from typing import List, Tuple, Dict
+
 import streamlit as st
 import requests
-import json
+from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont
-from moviepy.editor import TextClip, concatenate_videoclips
-from io import BytesIO
-from datetime import datetime
+from moviepy.video.VideoClip import TextClip, ImageClip
+from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip, concatenate_videoclips
+from moviepy.audio.io.AudioFileClip import AudioFileClip
+from moviepy.video.fx.Resize import Resize as vfx_resize
+from moviepy.audio.AudioClip import CompositeAudioClip
 import openai
+import googleapiclient.discovery
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
+from openai import OpenAI
 
-# ============ CONFIG ============
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+# -------------------------
+# Config & env variables
+# -------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")  # optional, for stock images
 
-openai.api_key = OPENAI_API_KEY
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
+S3_BASE_PATH = os.getenv("S3_BASE_PATH", "youtube-auto-studio/")
+S3_PUBLIC_READ = os.getenv("S3_PUBLIC_READ", "true").lower() == "true"
+S3_PRESIGN_EXPIRE_SECS = int(os.getenv("S3_PRESIGN_EXPIRE_SECS", "604800"))  # 7 days
 
-# ========= FUNCTIONS ============
+if not OPENAI_API_KEY:
+    st.error("Set OPENAI_API_KEY environment variable.")
+    st.stop()
+if not YOUTUBE_API_KEY:
+    st.error("Set YOUTUBE_API_KEY environment variable.")
+    st.stop()
 
-def search_trending_topics(niche, max_results=5):
-    """Search trending topics in a given niche using YouTube Data API"""
-    search_url = f"https://www.googleapis.com/youtube/v3/search?part=snippet&q={niche}&type=video&order=viewCount&maxResults={max_results}&key={YOUTUBE_API_KEY}"
-    resp = requests.get(search_url)
-    data = resp.json()
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+YOUTUBE_API_SERVICE_NAME = "youtube"
+YOUTUBE_API_VERSION = "v3"
+YOUTUBE_SEARCH_PUBLISHED_AFTER = os.getenv("YOUTUBE_SEARCH_PUBLISHED_AFTER", "2025-01-01T00:00:00Z")
+
+# -------------------------
+# Helper utilities
+# -------------------------
+def safe_file_name(s: str) -> str:
+    return "".join(c if c.isalnum() or c in " ._-" else "_" for c in s)[:120]
+
+
+def fetch_trending_videos_from_youtube(query: str, max_results: int = 10) -> List[dict]:
+    youtube = googleapiclient.discovery.build(
+        YOUTUBE_API_SERVICE_NAME, YOUTUBE_API_VERSION, developerKey=YOUTUBE_API_KEY
+    )
+    req = youtube.search().list(
+        q=query,
+        part="snippet",
+        type="video",
+        order="viewCount",
+        maxResults=max_results,
+        publishedAfter=YOUTUBE_SEARCH_PUBLISHED_AFTER,
+    )
+    res = req.execute()
     results = []
-    for item in data.get("items", []):
-        title = item["snippet"]["title"]
-        video_id = item["id"]["videoId"]
-        results.append({"title": title, "video_id": video_id})
+    for item in res.get("items", []):
+        vid = item["id"]["videoId"]
+        snippet = item["snippet"]
+        results.append({
+            "video_id": vid,
+            "title": snippet.get("title"),
+            "channel": snippet.get("channelTitle"),
+            "publishedAt": snippet.get("publishedAt"),
+            "description": snippet.get("description", ""),
+            "url": f"https://www.youtube.com/watch?v={vid}",
+        })
     return results
 
-def check_copyright(video_id):
-    """Naive copyright check using YouTube captions & description keywords"""
-    url = f"https://www.googleapis.com/youtube/v3/videos?part=snippet&id={video_id}&key={YOUTUBE_API_KEY}"
-    resp = requests.get(url).json()
-    description = resp["items"][0]["snippet"]["description"].lower()
-    keywords = ["copyright", "all rights reserved", "licensed"]
-    return not any(kw in description for kw in keywords)  # True if safe
 
-def generate_script(topic):
-    """Generate video script with OpenAI"""
-    prompt = f"Write an engaging, 1-minute YouTube video script about: {topic}"
-    resp = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7
+def get_video_license(youtube_client, video_id: str) -> str:
+    resp = youtube_client.videos().list(part="status", id=video_id).execute()
+    items = resp.get("items", [])
+    if not items:
+        return "unknown"
+    status = items[0].get("status", {})
+    return status.get("license", "unknown")  # 'creativeCommon' or 'youtube' (standard)
+
+
+def call_openai_rank_topics(videos: List[dict]) -> str:
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    video_text = "\n".join([f"{i+1}. {v['title']} — {v['url']} — by {v['channel']}" for i, v in enumerate(videos)])
+    system = "You are a concise YouTube trend analyst. Output exactly three suggested topic headlines (not full scripts) with 1-line reason each."
+    user = f"Here are trending videos in the niche:\n\n{video_text}\n\nReturn in this format:\n1) Title: <title>\n   Reason: <one short reason>\n2) Title: ...\n3) Title: ..."
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        temperature=0.35,
+        max_tokens=500,
     )
-    return resp.choices[0].message["content"]
+    return resp.choices[0].message.content.strip()
 
-def create_thumbnail(text, filename="thumbnail.png"):
-    """Create simple thumbnail using Pillow"""
-    img = Image.new('RGB', (1280, 720), color=(255, 0, 0))
-    draw = ImageDraw.Draw(img)
-    font = ImageFont.load_default()
-    draw.text((50, 300), text, font=font, fill=(255, 255, 255))
-    img.save(filename)
-    return filename
 
-def create_video(script_text, thumbnail_path, filename="video.mp4"):
-    """Create a simple text-based video"""
-    clips = []
-    lines = script_text.split(". ")
-    for line in lines:
-        txt_clip = TextClip(line, fontsize=40, color='white', bg_color='black', size=(1280, 720)).set_duration(3)
-        clips.append(txt_clip)
-    final_clip = concatenate_videoclips(clips)
-    final_clip.save_frame(thumbnail_path)  # Use first frame as thumbnail
-    final_clip.write_videofile(filename, fps=24)
-    return filename
+def parse_ranked_text(text: str) -> List[Tuple[str, str]]:
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    results: List[Dict[str, str]] = []
+    current: Dict[str, str] = {}
+    for ln in lines:
+        if ln[0].isdigit() and "Title:" in ln:
+            title = ln.split("Title:", 1)[1].strip()
+            current = {"title": title, "reason": ""}
+            results.append(current)
+        elif "Reason:" in ln and current is not None:
+            current["reason"] = ln.split("Reason:", 1)[1].strip()
+    return [(r["title"], r["reason"]) for r in results]
 
-# ========= STREAMLIT APP =========
 
-st.title("📺 YouTube Niche Automation Tool")
-st.write("Find trending topics, check copyright, create thumbnails, and generate videos automatically.")
-
-niche = st.text_input("Enter your niche:")
-if st.button("Search Trending Topics") and niche:
-    topics = search_trending_topics(niche)
-    safe_topics = []
-    for t in topics:
-        if check_copyright(t["video_id"]):
-            safe_topics.append(t)
-    if safe_topics:
-        selected_topic = st.selectbox("Select a topic for video:", [t["title"] for t in safe_topics])
-        if st.button("Generate Video Script"):
-            script = generate_script(selected_topic)
-            st.text_area("Generated Script", script, height=200)
-            thumb_path = create_thumbnail(selected_topic)
-            st.image(thumb_path, caption="Generated Thumbnail")
-            if st.button("Create Video"):
-                video_path = create_video(script, thumb_path)
-                with open(video_path, "rb") as f:
-                    st.download_button("Download Video", f, file_name="youtube_video.mp4")
+def llm_copyright_check(topic_title: str, context_text: str) -> Tuple[str, str]:
+    """
+    Ask LLM to classify risk: returns ("SAFE" or "RISK", explanation)
+    """
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    system = (
+        "You are a cautious content-safety assistant. Classify whether creating a video on the given topic title risks "
+        "copyright/trademark/rights-of-publicity or uses copyrighted characters/music/brands. Return exactly SAFE or "
+        "RISK followed by a short reason."
+    )
+    user = (
+        f"Topic title: {topic_title}\n\nContext (examples / related text):\n{context_text}\n\n"
+        "Answer format:\nSAFE: short reason OR RISK: short reason"
+    )
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        temperature=0.0,
+        max_tokens=200,
+    )
+    out = resp.choices[0].message.content.strip()
+    if out.upper().startswith("SAFE"):
+        return "SAFE", out.split(":", 1)[1].strip() if ":" in out else ""
+    elif out.upper().startswith("RISK"):
+        return "RISK", out.split(":", 1)[1].strip() if ":" in out else ""
     else:
-        st.warning("No safe topics found.")
+        return ("RISK", out) if "copyright" in out.lower() or "trademark" in out.lower() else ("SAFE", out)
+
+
+def generate_script_openai(topic: str) -> str:
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    system = "You are a professional concise YouTube script writer. Produce a short script suitable for a 60-120s video."
+    user = (
+        f"Write an engaging YouTube video script for the topic: \"{topic}\".\n"
+        "- Hook (first 5-10s)\n- 3 short bullet points for main content\n- Quick summary\n- Call to action: like/subscribe\nKeep sentences short and energetic."
+    )
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        temperature=0.6,
+        max_tokens=700,
+    )
+    return resp.choices[0].message.content.strip()
+
+
+# -------------------------
+# Image helpers (Pexels fallback)
+# -------------------------
+def pexels_search_images(query: str, per_page: int = 6) -> List[str]:
+    if not PEXELS_API_KEY:
+        return [
+            "https://images.pexels.com/photos/3183186/pexels-photo-3183186.jpeg",
+            "https://images.pexels.com/photos/1181675/pexels-photo-1181675.jpeg",
+            "https://images.pexels.com/photos/3861969/pexels-photo-3861969.jpeg",
+            "https://images.pexels.com/photos/414519/pexels-photo-414519.jpeg",
+            "https://images.pexels.com/photos/842711/pexels-photo-842711.jpeg",
+            "https://images.pexels.com/photos/1103539/pexels-photo-1103539.jpeg",
+        ][:per_page]
+    headers = {"Authorization": PEXELS_API_KEY}
+    params = {"query": query, "per_page": per_page}
+    resp = requests.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=15)
+    resp.raise_for_status()
+    items = resp.json().get("photos", [])
+    urls = []
+    for p in items:
+        src = p.get("src", {}).get("landscape") or p.get("src", {}).get("large")
+        if src:
+            urls.append(src)
+    return urls
+
+
+def download_image(url: str, dest: Path) -> Path:
+    r = requests.get(url, stream=True, timeout=20)
+    r.raise_for_status()
+    with open(dest, "wb") as f:
+        for chunk in r.iter_content(8192):
+            f.write(chunk)
+    return dest
+
+
+# -------------------------
+# Subtitles + TTS helpers (gTTS chunking)
+# -------------------------
+def split_text_into_chunks(text: str, max_chars: int = 180) -> List[str]:
+    text = re.sub(r"\s+", " ", text.strip())
+    if not text:
+        return []
+    # Split into sentences using simple regex
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    chunks: List[str] = []
+    current = ""
+    for sent in sentences:
+        if len(current) + len(sent) + 1 <= max_chars:
+            current = (current + " " + sent).strip()
+        else:
+            if current:
+                chunks.append(current)
+            if len(sent) <= max_chars:
+                current = sent
+            else:
+                # Hard wrap long sentences
+                for i in range(0, len(sent), max_chars):
+                    chunk = sent[i : i + max_chars]
+                    if chunk:
+                        chunks.append(chunk)
+                current = ""
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def write_srt(srt_entries: List[Tuple[int, float, float, str]], out_path: Path) -> Path:
+    # entries: (index starting at 1, start_sec, end_sec, text)
+    def fmt_time(sec: float) -> str:
+        millis = int(round((sec - int(sec)) * 1000))
+        sec = int(sec)
+        h = sec // 3600
+        m = (sec % 3600) // 60
+        s = sec % 60
+        return f"{h:02d}:{m:02d}:{s:02d},{millis:03d}"
+
+    lines: List[str] = []
+    for idx, start_s, end_s, text in srt_entries:
+        lines.append(str(idx))
+        lines.append(f"{fmt_time(start_s)} --> {fmt_time(end_s)}")
+        lines.append(text)
+        lines.append("")
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    return out_path
+
+
+def text_to_speech_gtts(text: str, out_path: Path, lang: str = "en"):
+    tts = gTTS(text, lang=lang)
+    tts.save(str(out_path))
+    return out_path
+
+
+def tts_chunks_and_srt(script_text: str, temp_dir: Path, lang: str = "en") -> Tuple[AudioFileClip, Path, List[Tuple[int, float, float, str]]]:
+    chunks = split_text_into_chunks(script_text, max_chars=180)
+    if not chunks:
+        raise RuntimeError("No text to synthesize.")
+
+    audio_clips: List[AudioFileClip] = []
+    srt_entries: List[Tuple[int, float, float, str]] = []
+    cursor = 0.0
+    for idx, chunk in enumerate(chunks, start=1):
+        path = temp_dir / f"tts_{idx:03d}.mp3"
+        text_to_speech_gtts(chunk, path, lang=lang)
+        clip = AudioFileClip(str(path))
+        start = cursor
+        end = cursor + clip.duration
+        srt_entries.append((idx, start, end, chunk))
+        audio_clips.append(clip)
+        cursor = end
+
+    # MoviePy 2.x lacks helper; manually concatenate via CompositeAudioClip + set_start
+    cursor = 0.0
+    positioned = []
+    for ac in audio_clips:
+        positioned.append(ac.set_start(cursor))
+        cursor += ac.duration
+    final_audio = CompositeAudioClip(positioned)
+    srt_path = temp_dir / "subtitles.srt"
+    write_srt(srt_entries, srt_path)
+    return final_audio, srt_path, srt_entries
+
+
+# -------------------------
+# Video assembly (MoviePy)
+# -------------------------
+def build_video_from_script_and_images(script_text: str, image_urls: List[str], out_video_path: Path, title_text: str) -> Tuple[Path, Path]:
+    tmpdir = Path(tempfile.mkdtemp())
+
+    # Create chunked audio + SRT
+    final_audio, srt_path, srt_entries = tts_chunks_and_srt(script_text, tmpdir, lang="en")
+
+    # Download images
+    image_files: List[Path] = []
+    for i, url in enumerate(image_urls):
+        try:
+            img_path = tmpdir / f"img_{i}.jpg"
+            download_image(url, img_path)
+            image_files.append(img_path)
+        except Exception as e:
+            print("Image download failed:", e)
+    if not image_files:
+        raise RuntimeError("No images to build video.")
+
+    # Parameters for 1080p
+    W, H = 1920, 1080
+
+    # Title clip (3s) at 1080p
+    try:
+        title_clip = (
+            TextClip(title_text, fontsize=80, color="white", size=(W, H), method="caption", font="DejaVu-Sans-Bold")
+            .set_duration(3)
+            .on_color(size=(W, H), color=(20, 20, 20))
+        )
+    except Exception:
+        title_clip = (
+            TextClip(title_text, fontsize=60, color="white", size=(W, H), method="caption")
+            .set_duration(3)
+            .on_color(size=(W, H), color=(20, 20, 20))
+        )
+
+    # Build image clips
+    # Each clip duration approx = audio.duration / n_images (>= 3s)
+    n = len(image_files)
+    per_clip = max(3.0, final_audio.duration / max(1, n))
+    clips: List[ImageClip] = []
+    for idx, img in enumerate(image_files):
+        clip = ImageClip(str(img)).set_duration(per_clip)
+        # Resize preserving aspect, then center crop to 1080p, plus subtle Ken Burns zoom
+        if clip.w / clip.h >= W / H:
+            clip = clip.resize(height=H)
+        else:
+            clip = clip.resize(width=W)
+        x_center = (clip.w - W) // 2
+        y_center = (clip.h - H) // 2
+        clip = clip.crop(x1=x_center, y1=y_center, x2=x_center + W, y2=y_center + H)
+        # Subtle zoom in
+        try:
+            clip = vfx_resize(lambda t: 1.0 + 0.02 * (t / max(0.001, per_clip)))(clip)
+        except Exception:
+            pass
+        clips.append(clip)
+
+    slideshow = concatenate_videoclips(clips, method="compose")
+    full = concatenate_videoclips([title_clip, slideshow], method="compose")
+
+    # Ensure visual length >= audio
+    if full.duration < final_audio.duration:
+        last = clips[-1].set_duration(final_audio.duration - full.duration)
+        full = concatenate_videoclips([full, last], method="compose")
+
+    final = full.set_audio(final_audio).set_duration(final_audio.duration)
+
+    # High-quality export settings
+    final.write_videofile(
+        str(out_video_path),
+        fps=30,
+        codec="libx264",
+        audio_codec="aac",
+        preset="slow",
+        bitrate=None,
+        ffmpeg_params=[
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-profile:v",
+            "high",
+            "-level",
+            "4.2",
+            "-movflags",
+            "+faststart",
+        ],
+        threads=os.cpu_count() or 2,
+    )
+
+    return out_video_path, srt_path
+
+
+# -------------------------
+# Thumbnail generation (Pillow)
+# -------------------------
+def generate_thumbnail_pillow(title: str, out_path: Path, subtitle: str = ""):
+    W, H = 1280, 720
+    bg_color = (18, 18, 18)
+    img = Image.new("RGB", (W, H), color=bg_color)
+    draw = ImageDraw.Draw(img)
+
+    try:
+        font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", 64)
+        font_sub = ImageFont.truetype("DejaVuSans.ttf", 36)
+    except Exception:
+        font_title = ImageFont.load_default()
+        font_sub = ImageFont.load_default()
+
+    accent = Image.new("RGB", (W, 160), color=(255, 80, 80))
+    img.paste(accent, (0, H - 160))
+
+    max_width = W - 120
+    words = title.split()
+    lines: List[str] = []
+    cur = ""
+    for w in words:
+        test = (cur + " " + w).strip()
+        if draw.textlength(test, font=font_title) <= max_width:
+            cur = test
+        else:
+            if cur:
+                lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+
+    y = 140
+    for line in lines[:3]:
+        tw = draw.textlength(line, font=font_title)
+        th = font_title.size + 6
+        draw.text(((W - tw) / 2, y), line, font=font_title, fill=(255, 255, 255))
+        y += th
+
+    if subtitle:
+        sw = draw.textlength(subtitle, font=font_sub)
+        draw.text(((W - sw) / 2, H - 120), subtitle, font=font_sub, fill=(255, 255, 255))
+
+    img.save(out_path)
+    return out_path
+
+
+# -------------------------
+# S3 storage helpers
+# -------------------------
+def get_s3_client():
+    if not (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and S3_BUCKET_NAME):
+        return None
+    return boto3.client(
+        "s3",
+        region_name=AWS_REGION,
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    )
+
+
+def s3_upload_file(local_path: Path, content_type: str = None) -> Tuple[bool, str]:
+    s3 = get_s3_client()
+    if not s3:
+        return False, ""
+    key = f"{S3_BASE_PATH}{safe_file_name(local_path.name)}"
+    extra_args = {}
+    if content_type:
+        extra_args["ContentType"] = content_type
+    if S3_PUBLIC_READ:
+        extra_args["ACL"] = "public-read"
+    try:
+        s3.upload_file(str(local_path), S3_BUCKET_NAME, key, ExtraArgs=extra_args)
+        if S3_PUBLIC_READ:
+            url = f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{key}"
+            return True, url
+        else:
+            url = s3.generate_presigned_url(
+                ClientMethod="get_object",
+                Params={"Bucket": S3_BUCKET_NAME, "Key": key},
+                ExpiresIn=S3_PRESIGN_EXPIRE_SECS,
+            )
+            return True, url
+    except (BotoCoreError, ClientError) as e:
+        print("S3 upload failed:", e)
+        return False, ""
+
+
+# -------------------------
+# Streamlit UI
+# -------------------------
+st.set_page_config(page_title="YouTube Auto Studio (copyright + SRT + S3)", page_icon="🎬", layout="wide")
+st.title("YouTube Auto Studio — Niche → Topic → Script → Video → Thumbnail")
+
+with st.sidebar:
+    st.header("Config")
+    st.write("Ensure env vars:\n- OPENAI_API_KEY\n- YOUTUBE_API_KEY\n(optional) PEXELS_API_KEY\n(optional) AWS_ACCESS_KEY_ID/SECRET, S3_BUCKET_NAME")
+    st.write("Note: This app builds videos and can upload to S3 for public links (good for Render).")
+    safety_mode = st.checkbox("Safety mode (require LLM SAFE + creativeCommons)", value=True)
+
+col1, col2 = st.columns([3, 1])
+with col1:
+    niche = st.text_input("Enter niche keyword (e.g., 'AI tools', 'solar energy'):", value="AI automation")
+with col2:
+    max_results = st.number_input("Search results", min_value=3, max_value=20, value=8, step=1)
+
+if st.button("Fetch trending & suggest topics"):
+    try:
+        with st.spinner("Searching YouTube..."):
+            vids = fetch_trending_videos_from_youtube(niche, max_results=int(max_results))
+            st.session_state["videos"] = vids
+        if not vids:
+            st.warning("No videos found.")
+        else:
+            st.success(f"Fetched {len(vids)} videos.")
+            for v in vids[:8]:
+                st.markdown(f"- [{v['title']}]({v['url']}) — {v['channel']} — {v['publishedAt']}")
+            with st.spinner("Asking OpenAI to pick top 3 topics..."):
+                ranked_text = call_openai_rank_topics(vids)
+                st.session_state["ranked_text"] = ranked_text
+                st.session_state["suggestions"] = parse_ranked_text(ranked_text)
+                st.success("Top 3 suggestions generated.")
+    except Exception as e:
+        st.error(f"Error: {e}")
+
+if "suggestions" in st.session_state:
+    st.subheader("Top 3 Suggested Topics")
+    for idx, (title, reason) in enumerate(st.session_state["suggestions"], start=1):
+        st.markdown(f"**{idx}) {title}**  \n_{reason}_")
+    chosen = st.selectbox("Choose topic to generate script", [t for t, r in st.session_state["suggestions"]])
+    st.session_state["chosen_title"] = chosen
+    if st.button("Run copyright & license safety check for chosen topic"):
+        with st.spinner("Running safety checks..."):
+            context_text = "\n".join([f"{v['title']} — {v['url']}" for v in st.session_state.get("videos", [])[:6]])
+            status, explanation = llm_copyright_check(chosen, context_text)
+            st.session_state["copyright_llm_status"] = (status, explanation)
+            youtube = googleapiclient.discovery.build(
+                YOUTUBE_API_SERVICE_NAME, YOUTUBE_API_VERSION, developerKey=YOUTUBE_API_KEY
+            )
+            licenses: Dict[str, str] = {}
+            for v in st.session_state.get("videos", [])[:6]:
+                lic = get_video_license(youtube, v["video_id"]) or "unknown"
+                licenses[v["video_id"]] = lic
+            st.session_state["video_licenses"] = licenses
+            st.success("Safety checks complete.")
+    if "copyright_llm_status" in st.session_state:
+        st.markdown("**LLM copyright check:**")
+        st.write(st.session_state["copyright_llm_status"])
+        st.markdown("**Top videos' YouTube license types (first 6):**")
+        for vid, lic in st.session_state.get("video_licenses", {}).items():
+            st.write(f"- {vid}: {lic}")
+        llm_status, llm_reason = st.session_state["copyright_llm_status"]
+        if llm_status == "RISK":
+            st.warning(f"LLM flagged RISK: {llm_reason}.")
+        else:
+            st.success(f"LLM flagged SAFE: {llm_reason}")
+
+    def passes_safety_gate() -> bool:
+        if not safety_mode:
+            return True
+        llm_status = st.session_state.get("copyright_llm_status", ("RISK", ""))[0]
+        licenses = st.session_state.get("video_licenses", {})
+        any_cc = any(lic.lower() == "creativecommon" for lic in licenses.values())
+        if llm_status == "SAFE" and any_cc:
+            return True
+        return False
+
+    if st.button("Generate script for chosen topic"):
+        if safety_mode and not passes_safety_gate():
+            st.error("Safety mode is ON: Requires LLM SAFE and at least one creativeCommons video in the fetched list.")
+        else:
+            with st.spinner("Generating script..."):
+                script = generate_script_openai(chosen)
+                st.session_state["script"] = script
+                st.success("Script generated.")
+                st.text_area("Generated Script", script, height=300)
+
+if "script" in st.session_state:
+    st.subheader("Create audio, video, subtitles, and thumbnail")
+    colA, colB, colC = st.columns([1, 1, 1])
+    with colA:
+        if st.button("Generate Audio + SRT (chunked)"):
+            if st.sidebar.checkbox("Re-run TTS", value=True, key="re_tts"):
+                try:
+                    tmpdir = Path(tempfile.gettempdir())
+                    base = safe_file_name(st.session_state.get("script", "script"))
+                    temp_audio = Path(tmpdir) / f"{base}_narration.mp3"
+                    # Build once to persist files (the video builder also runs this, but we expose it here for downloads)
+                    audio_clip, srt_path, _ = tts_chunks_and_srt(st.session_state["script"], Path(tempfile.mkdtemp()))
+                    audio_clip.write_audiofile(str(temp_audio))
+                    st.session_state["audio_path"] = str(temp_audio)
+                    st.session_state["srt_path"] = str(srt_path)
+                    st.success(f"Audio + SRT created: {temp_audio}, {srt_path}")
+                except Exception as e:
+                    st.error(f"Audio creation failed: {e}")
+    with colB:
+        num_images = st.number_input("Number of images for slideshow", min_value=2, max_value=12, value=6)
+        if st.button("Assemble Video (1080p + audio)"):
+            if safety_mode and not (st.session_state.get("script") and (not st.session_state.get("copyright_llm_status") or st.session_state.get("copyright_llm_status")[0] == "SAFE") and any((lic.lower() == "creativecommon") for lic in st.session_state.get("video_licenses", {}).values())):
+                st.error("Safety mode is ON: Requires LLM SAFE and at least one creativeCommons video in the fetched list.")
+            else:
+                try:
+                    with st.spinner("Fetching images and building video..."):
+                        images = pexels_search_images(niche, per_page=int(num_images))
+                        tmp_video = Path(tempfile.gettempdir()) / f"{safe_file_name(st.session_state.get('script','video'))}.mp4"
+                        video_path, srt_path = build_video_from_script_and_images(st.session_state["script"], images, tmp_video, title_text=st.session_state.get("chosen_title", "" ) or safe_file_name(niche))
+                        st.session_state["video_path"] = str(video_path)
+                        st.session_state["srt_path"] = str(srt_path)
+                        st.success(f"Video built: {tmp_video}")
+                        st.video(str(tmp_video))
+                except Exception as e:
+                    st.error(f"Video assembly failed: {e}")
+    with colC:
+        if st.button("Generate Thumbnail (Pillow)"):
+            try:
+                tmp_thumb = Path(tempfile.gettempdir()) / f"{safe_file_name(niche)}_thumb.jpg"
+                generate_thumbnail_pillow(safe_file_name(niche)[:80], tmp_thumb, subtitle="Auto-generated")
+                st.session_state["thumb_path"] = str(tmp_thumb)
+                st.success(f"Thumbnail generated: {tmp_thumb}")
+                st.image(str(tmp_thumb), width=480)
+            except Exception as e:
+                st.error(f"Thumbnail creation failed: {e}")
+
+if "video_path" in st.session_state or "audio_path" in st.session_state or "thumb_path" in st.session_state or "srt_path" in st.session_state:
+    st.subheader("Download or S3 links")
+    video_path = st.session_state.get("video_path")
+    audio_path = st.session_state.get("audio_path")
+    srt_path = st.session_state.get("srt_path")
+    thumb_path = st.session_state.get("thumb_path")
+
+    # Local download buttons
+    if video_path and Path(video_path).exists():
+        with open(video_path, "rb") as f:
+            st.download_button("Download video (MP4)", data=f.read(), file_name=Path(video_path).name, mime="video/mp4")
+    if audio_path and Path(audio_path).exists():
+        with open(audio_path, "rb") as f:
+            st.download_button("Download audio (MP3)", data=f.read(), file_name=Path(audio_path).name, mime="audio/mpeg")
+    if srt_path and Path(srt_path).exists():
+        with open(srt_path, "rb") as f:
+            st.download_button("Download subtitles (SRT)", data=f.read(), file_name=Path(srt_path).name, mime="application/x-subrip")
+    if thumb_path and Path(thumb_path).exists():
+        with open(thumb_path, "rb") as f:
+            st.download_button("Download thumbnail (JPG)", data=f.read(), file_name=Path(thumb_path).name, mime="image/jpeg")
+
+    # S3 upload and public links
+    if S3_BUCKET_NAME and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+        st.write("S3 uploads:")
+        up_results = []
+        if video_path and Path(video_path).exists():
+            ok, url = s3_upload_file(Path(video_path), content_type="video/mp4")
+            if ok:
+                st.write(f"- Video: {url}")
+        if audio_path and Path(audio_path).exists():
+            ok, url = s3_upload_file(Path(audio_path), content_type="audio/mpeg")
+            if ok:
+                st.write(f"- Audio: {url}")
+        if srt_path and Path(srt_path).exists():
+            ok, url = s3_upload_file(Path(srt_path), content_type="application/x-subrip")
+            if ok:
+                st.write(f"- Subtitles: {url}")
+        if thumb_path and Path(thumb_path).exists():
+            ok, url = s3_upload_file(Path(thumb_path), content_type="image/jpeg")
+            if ok:
+                st.write(f"- Thumbnail: {url}")
+
+st.caption(
+    "Notes: This app can run locally or on Render. Large files are uploaded to S3 if configured. MoviePy encoding is CPU-intensive—use an instance with adequate CPU."
+)
