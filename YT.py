@@ -475,10 +475,10 @@ def build_video_from_script_and_images(
     clips: List[ImageClip] = []
     for idx, img in enumerate(image_files):
         # Duration passed in constructor; avoid set_duration on ImageClip
-                # Resize preserving aspect to cover, then center crop to 1080p
+        # Resize preserving aspect to cover, then center crop to 1080p
         img_arr = pillow_fit_center_crop(str(img), W, H)
-	clip = ImageClip(img_arr, duration=per_clip)
-	clips.append(clip)
+		clip = ImageClip(img_arr, duration=per_clip)
+		clips.append(clip)
        
 
 
