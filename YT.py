@@ -10,10 +10,10 @@ import requests
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont
 from moviepy.video.VideoClip import TextClip, ImageClip
-from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip
-from moviepy.video.compositing.concatenate import concatenate_videoclips
-from moviepy.audio.AudioClip import AudioArrayClip
+from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip, concatenate_videoclips
 from moviepy.audio.io.AudioFileClip import AudioFileClip
+from moviepy.video.fx.Resize import Resize as vfx_resize
+from moviepy.audio.AudioClip import CompositeAudioClip, AudioClip as BaseAudioClip, AudioArrayClip
 import numpy as np
 import traceback
 import openai
