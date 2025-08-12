@@ -9,11 +9,9 @@ import streamlit as st
 import requests
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont
-from moviepy.video.VideoClip import TextClip, ImageClip
-from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip, concatenate_videoclips
+from moviepy.editor import TextClip, ImageClip, CompositeVideoClip, concatenate_videoclips
 from moviepy.audio.io.AudioFileClip import AudioFileClip
-from moviepy.video.fx.Resize import Resize as vfx_resize
-from moviepy.audio.AudioClip import CompositeAudioClip, AudioClip as BaseAudioClip, AudioArrayClip
+from moviepy.audio.AudioClip import AudioArrayClip
 import numpy as np
 import traceback
 import openai
@@ -21,12 +19,6 @@ import googleapiclient.discovery
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from openai import OpenAI
-
-try:
-    from pydub import AudioSegment  # optional, for robust MP3 decoding
-    _HAS_PYDUB = True
-except Exception:
-    _HAS_PYDUB = False
 
 # -------------------------
 # Config & env variables
@@ -280,7 +272,7 @@ def text_to_speech_gtts(text: str, out_path: Path, lang: str = "en"):
 # -------------------------
 STAGE_KEYWORDS = r"music|sfx|sound|beat|applause|transition|intro|outro|fx|bgm|beatdrop|whoosh|ding|sting"
 
-PAREN_STAGE_RE = re.compile(r"\((?:[^)]*(?:" + STAGE_KEYWORDS + r")[^)]*)\)", flags=re.IGNORECASE)
+PAREN_STAGE_RE = re.compile(r"\((?:[^)]]*(?:" + STAGE_KEYWORDS + r")[^)]*)\)", flags=re.IGNORECASE)
 
 
 def clean_script_for_tts(text: str) -> str:
@@ -300,42 +292,6 @@ def clean_script_for_tts(text: str) -> str:
     return text
 
 
-def audiofile_to_array_safe(file_path: str, fps: int = 44100) -> np.ndarray:
-    """Decode an audio file (mp3) into a float32 numpy array of shape (samples, 2) at given fps.
-    Prefers pydub for robustness; falls back to MoviePy with epsilon trimming to avoid boundary errors.
-    """
-    try:
-        if _HAS_PYDUB:
-            seg = AudioSegment.from_file(file_path)
-            seg = seg.set_frame_rate(fps).set_channels(2).set_sample_width(2)  # 16-bit stereo
-            raw = seg.get_array_of_samples()
-            arr = np.array(raw).astype(np.float32) / 32768.0
-            arr = arr.reshape((-1, 2))
-            return arr
-        else:
-            clip = AudioFileClip(file_path)
-            try:
-                dur = float(clip.duration or 0.0)
-                if dur <= 0:
-                    return np.zeros((0, 2), dtype=np.float32)
-                # Trim a tiny epsilon at the end to avoid boundary read
-                epsilon = 1.0 / fps
-                end = max(0.0, dur - epsilon)
-                sub = clip.subclip(0, end) if end > 0 else clip.subclip(0, dur)
-                arr = sub.to_soundarray(fps=fps)
-                if arr.ndim == 1:
-                    arr = np.stack([arr, arr], axis=1)
-                return arr.astype(np.float32)
-            finally:
-                try:
-                    clip.close()
-                except Exception:
-                    pass
-    except Exception:
-        # As a last resort, return empty audio
-        return np.zeros((0, 2), dtype=np.float32)
-
-
 def tts_chunks_and_srt(script_text: str, temp_dir: Path, lang: str = "en") -> Tuple[AudioArrayClip, Path, List[Tuple[int, float, float, str]]]:
     # Clean stage directions before chunking/tts
     script_text = clean_script_for_tts(script_text)
@@ -351,16 +307,22 @@ def tts_chunks_and_srt(script_text: str, temp_dir: Path, lang: str = "en") -> Tu
     for idx, chunk in enumerate(chunks, start=1):
         path = temp_dir / f"tts_{idx:03d}.mp3"
         text_to_speech_gtts(chunk, path, lang=lang)
-        arr = audiofile_to_array_safe(str(path), fps=fps)
-        if arr.size == 0:
-            continue
-        n_channels = arr.shape[1]
-        audio_arrays.append(arr)
-        length_s = arr.shape[0] / float(fps)
-        start = cursor
-        end = cursor + length_s
-        srt_entries.append((idx, start, end, chunk))
-        cursor = end
+        clip = AudioFileClip(str(path))
+        try:
+            arr = clip.to_soundarray(fps=fps)
+            if arr.ndim == 1:
+                arr = np.stack([arr, arr], axis=1)
+            n_channels = arr.shape[1]
+            audio_arrays.append(arr)
+            start = cursor
+            end = cursor + clip.duration
+            srt_entries.append((idx, start, end, chunk))
+            cursor = end
+        finally:
+            try:
+                clip.close()
+            except Exception:
+                pass
 
     final_array = np.concatenate(audio_arrays, axis=0) if audio_arrays else np.zeros((1, n_channels), dtype=np.float32)
     final_audio = AudioArrayClip(final_array, fps=fps)
@@ -369,9 +331,11 @@ def tts_chunks_and_srt(script_text: str, temp_dir: Path, lang: str = "en") -> Tu
     return final_audio, srt_path, srt_entries
 
 
+# -------------------------
+# Title (Pillow fallback)
+# -------------------------
 def _pillow_title_clip(title_text: str, width: int, height: int, duration: float = 3.0,
                        bg_color=(20, 20, 20), font_color=(255, 255, 255)):
-    # Pillow-rendered title frame, returned as a MoviePy ImageClip
     try:
         font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", 96)
     except Exception:
@@ -385,7 +349,7 @@ def _pillow_title_clip(title_text: str, width: int, height: int, duration: float
 
     max_text_width = width - 160
     words = (title_text or "").split()
-    lines = []
+    lines: List[str] = []
     current = ""
     for w in words:
         test = (current + " " + w).strip()
@@ -398,7 +362,7 @@ def _pillow_title_clip(title_text: str, width: int, height: int, duration: float
     if current:
         lines.append(current)
 
-    line_height = (font_title.size or 60) + 10
+    line_height = getattr(font_title, "size", 60) + 10
     total_text_height = max(line_height, len(lines) * line_height)
     y = (height - total_text_height) // 2
 
@@ -407,15 +371,7 @@ def _pillow_title_clip(title_text: str, width: int, height: int, duration: float
         draw.text(((width - tw) / 2, y), line, font=font_title, fill=font_color)
         y += line_height
 
-    return ImageClip(np.array(img)).set_duration(duration)
-
-
-
-
-
-
-
-
+    return ImageClip(np.array(img), duration=duration)
 
 
 # -------------------------
@@ -498,28 +454,39 @@ def build_video_from_script_and_images(
     per_clip = max(2.0, base_duration / max(1, n))
     clips: List[ImageClip] = []
     for idx, img in enumerate(image_files):
-        clip = ImageClip(str(img)).set_duration(per_clip)
-        # Resize preserving aspect, then center crop to 1080p, plus subtle Ken Burns zoom
+        # Duration passed in constructor; avoid set_duration on ImageClip
+        clip = ImageClip(str(img), duration=per_clip)
+
+        # Resize preserving aspect to cover, then center crop to 1080p
         if clip.w / clip.h >= W / H:
             clip = clip.resize(height=H)
         else:
             clip = clip.resize(width=W)
-        x_center = (clip.w - W) // 2
-        y_center = (clip.h - H) // 2
+        x_center = int((clip.w - W) // 2)
+        y_center = int((clip.h - H) // 2)
         clip = clip.crop(x1=x_center, y1=y_center, x2=x_center + W, y2=y_center + H)
+
+        # Subtle Ken Burns zoom (use method API, not vfx import)
         try:
-            clip = vfx_resize(lambda t: 1.0 + 0.02 * (t / max(0.001, per_clip)))(clip)
+            clip = clip.resize(lambda t: 1.0 + 0.02 * (t / max(0.001, per_clip)))
         except Exception:
             pass
+
         clips.append(clip)
 
     slideshow = concatenate_videoclips(clips, method="compose")
     full = concatenate_videoclips([title_clip, slideshow], method="compose")
 
-    # Ensure visual length >= audio
+    # Ensure visual length >= audio; pad last frame if needed
     if full.duration < final_audio.duration:
-        last = clips[-1].set_duration(final_audio.duration - full.duration)
-        full = concatenate_videoclips([full, last], method="compose")
+        leftover = final_audio.duration - full.duration
+        last_src = clips[-1]
+        try:
+            frame = last_src.get_frame(max(0.0, (last_src.duration or 0) - 1e-3))
+        except Exception:
+            frame = np.array(Image.open(str(image_files[-1])).convert("RGB"))
+        last_pad = ImageClip(frame, duration=leftover)
+        full = concatenate_videoclips([full, last_pad], method="compose")
 
     final = full.set_audio(final_audio).set_duration(final_audio.duration)
 
@@ -586,7 +553,7 @@ def generate_thumbnail_pillow(title: str, out_path: Path, subtitle: str = ""):
     y = 140
     for line in lines[:3]:
         tw = draw.textlength(line, font=font_title)
-        th = font_title.size + 6
+        th = font_title.size + 6 if hasattr(font_title, "size") else 70
         draw.text(((W - tw) / 2, y), line, font=font_title, fill=(255, 255, 255))
         y += th
 
