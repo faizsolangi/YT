@@ -569,6 +569,8 @@ with st.sidebar:
     st.session_state["prefer_cc"] = prefer_cc
     debug_mode = st.checkbox("Debug mode (show full errors)", value=False)
     st.session_state["debug_mode"] = debug_mode
+    confirm_royalty_free = st.checkbox("I confirm I will use only royalty-free/original media (e.g., Pexels, own assets)", value=False)
+    st.session_state["confirm_royalty_free"] = confirm_royalty_free
 
 col1, col2 = st.columns([3, 1])
 with col1:
@@ -647,6 +649,9 @@ if "suggestions" in st.session_state:
         any_cc = any((lic or "").lower() == "creativecommon" for lic in licenses.values())
         # If user prefers CC search and fetched results exist, treat as CC present
         if st.session_state.get("prefer_cc") and st.session_state.get("videos"):
+            any_cc = True
+        # If the user confirms only royalty-free/original media are used (e.g., Pexels images, gTTS audio), allow as CC-equivalent
+        if st.session_state.get("confirm_royalty_free"):
             any_cc = True
         return llm_status == "SAFE" and any_cc
 
