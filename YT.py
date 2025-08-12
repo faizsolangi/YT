@@ -2,6 +2,7 @@ import os
 import tempfile
 import re
 import json
+import time
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional, Any
 
@@ -16,6 +17,7 @@ import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from openai import OpenAI
 from pytrends.request import TrendReq
+from requests.exceptions import RequestException
 
 # MoviePy submodule imports (avoid moviepy.editor for compatibility)
 from moviepy.video.VideoClip import TextClip, ImageClip, VideoClip
@@ -624,45 +626,81 @@ def s3_upload_file(local_path: Path, content_type: str = None) -> Tuple[bool, st
 # Google Trends + SEO metadata
 # -------------------------
 def fetch_google_trends(niche: str, geo: str = "US", timeframe: str = "today 3-m", lang: str = "en-US") -> Dict[str, Any]:
-    pytrends = TrendReq(hl=lang, tz=360)
+    proxies_env = os.getenv("PYTRENDS_PROXIES", "").strip()
+    proxies = None
+    if proxies_env:
+        try:
+            proxies = json.loads(proxies_env)
+        except Exception:
+            # allow a simple http proxy string
+            proxies = {"https": proxies_env, "http": proxies_env}
+
+    def make_pytrends():
+        return TrendReq(hl=lang, tz=360, proxies=proxies)
+
     kw = niche.strip() or "trending"
-    pytrends.build_payload([kw], cat=0, timeframe=timeframe, geo=geo, gprop="")
+
+    # Backoff loop for build_payload which is the most common 429 source
+    backoff = 1.0
+    last_err = None
+    for attempt in range(5):
+        try:
+            pytrends = make_pytrends()
+            pytrends.build_payload([kw], cat=0, timeframe=timeframe, geo=geo, gprop="")
+            break
+        except Exception as e:
+            last_err = e
+            time.sleep(backoff)
+            backoff = min(backoff * 2.0, 16.0)
+    else:
+        # could not build payload; return minimal structure with error note
+        return {
+            "keyword": kw,
+            "geo": geo,
+            "timeframe": timeframe,
+            "related_queries_top": [],
+            "related_queries_rising": [],
+            "related_topics": [],
+            "interest_over_time": [],
+            "suggestions": [],
+            "error": f"build_payload_failed: {last_err}",
+        }
 
     data: Dict[str, Any] = {"keyword": kw, "geo": geo, "timeframe": timeframe}
 
-    try:
-        rq = pytrends.related_queries()
+    # Add small delay between calls to avoid 429 bursts
+    def try_call(fn, *args, **kwargs):
+        nonlocal backoff
+        try:
+            res = fn(*args, **kwargs)
+            time.sleep(0.7)
+            return res
+        except Exception as e:
+            # apply jittered backoff then return None
+            time.sleep(backoff + np.random.rand() * 0.5)
+            backoff = min(backoff * 1.6 + 0.3, 20.0)
+            return None
+
+    rq = try_call(pytrends.related_queries)
+    if isinstance(rq, dict):
         data["related_queries_top"] = (rq.get(kw, {}) or {}).get("top")
         data["related_queries_rising"] = (rq.get(kw, {}) or {}).get("rising")
-    except Exception as e:
-        data["related_queries_top"] = None
-        data["related_queries_rising"] = None
-        print("related_queries error:", e)
+    else:
+        data["related_queries_top"] = []
+        data["related_queries_rising"] = []
 
-    try:
-        topics = pytrends.related_topics()
-        data["related_topics"] = topics.get(kw)
-    except Exception as e:
-        data["related_topics"] = None
-        print("related_topics error:", e)
+    topics = try_call(pytrends.related_topics)
+    data["related_topics"] = topics.get(kw) if isinstance(topics, dict) else []
 
-    try:
-        iot = pytrends.interest_over_time()
-        if iot is not None and not iot.empty:
-            series = iot[kw].reset_index().rename(columns={kw: "score"})
-            data["interest_over_time"] = series.to_dict(orient="records")
-        else:
-            data["interest_over_time"] = []
-    except Exception as e:
+    iot = try_call(pytrends.interest_over_time)
+    if iot is not None and hasattr(iot, "empty") and not iot.empty and kw in iot.columns:
+        series = iot[kw].reset_index().rename(columns={kw: "score"})
+        data["interest_over_time"] = series.to_dict(orient="records")
+    else:
         data["interest_over_time"] = []
-        print("interest_over_time error:", e)
 
-    try:
-        sug = pytrends.suggestions(keyword=kw)
-        data["suggestions"] = sug
-    except Exception as e:
-        data["suggestions"] = []
-        print("suggestions error:", e)
+    sug = try_call(pytrends.suggestions, keyword=kw)
+    data["suggestions"] = sug if isinstance(sug, list) else []
 
     return data
 
