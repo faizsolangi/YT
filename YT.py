@@ -15,6 +15,7 @@ from moviepy.audio.io.AudioFileClip import AudioFileClip
 from moviepy.video.fx.Resize import Resize as vfx_resize
 from moviepy.audio.AudioClip import CompositeAudioClip, AudioClip as BaseAudioClip, AudioArrayClip
 import numpy as np
+import traceback
 import openai
 import googleapiclient.discovery
 import boto3
@@ -370,11 +371,14 @@ def build_video_from_script_and_images(
             .on_color(size=(W, H), color=(20, 20, 20))
         )
     except Exception:
-        title_clip = (
-            TextClip(title_text, fontsize=60, color="white", size=(W, H), method="caption")
-            .set_duration(3)
-            .on_color(size=(W, H), color=(20, 20, 20))
-        )
+        try:
+            title_clip = (
+                TextClip(title_text, fontsize=60, color="white", size=(W, H), method="caption")
+                .set_duration(3)
+                .on_color(size=(W, H), color=(20, 20, 20))
+            )
+        except Exception:
+            title_clip = _pillow_title_clip(title_text, W, H, duration=3.0)
 
     # Build image clips; base durations on enforced audio duration if present
     n = len(image_files)
@@ -536,6 +540,8 @@ with st.sidebar:
     safety_mode = st.checkbox("Safety mode (require LLM SAFE + creativeCommons)", value=True)
     prefer_cc = st.checkbox("Prefer Creative Commons in search", value=False)
     st.session_state["prefer_cc"] = prefer_cc
+    debug_mode = st.checkbox("Debug mode (show full errors)", value=False)
+    st.session_state["debug_mode"] = debug_mode
 
 col1, col2 = st.columns([3, 1])
 with col1:
@@ -669,6 +675,9 @@ if "script" in st.session_state:
                         st.video(str(tmp_video))
                 except Exception as e:
                     st.error(f"Video assembly failed: {e}")
+                    if st.session_state.get("debug_mode"):
+                        st.exception(e)
+                        st.code(traceback.format_exc())
     with colC:
         if st.button("Generate Thumbnail (Pillow)"):
             try:
