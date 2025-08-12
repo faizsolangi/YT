@@ -474,11 +474,9 @@ def build_video_from_script_and_images(
     per_clip = max(2.0, base_duration / max(1, n))
     clips: List[ImageClip] = []
     for idx, img in enumerate(image_files):
-        # Duration passed in constructor; avoid set_duration on ImageClip
-        # Resize preserving aspect to cover, then center crop to 1080p
-        img_arr = pillow_fit_center_crop(str(img), W, H)
-		clip = ImageClip(img_arr, duration=per_clip)
-		clips.append(clip)
+        frame = pillow_fit_center_crop(str(img), W, H)  # returns 1920x1080 np.ndarray
+        clip = ImageClip(frame, duration=per_clip)
+        clips.append(clip)
        
 
 
