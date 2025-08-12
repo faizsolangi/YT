@@ -716,7 +716,7 @@ if "script" in st.session_state:
                     st.session_state["srt_path"] = str(srt_path)
                     st.success(f"Video built: {tmp_video}")
                     st.video(str(tmp_video))
-                except Exception as e:
+                    except Exception as e:
                     st.error(f"Video assembly failed: {e}")
                     if st.session_state.get("debug_mode"):
                         st.exception(e)
