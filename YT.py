@@ -59,20 +59,17 @@ def fetch_trending_videos_from_youtube(query: str, max_results: int = 10, prefer
     youtube = googleapiclient.discovery.build(
         YOUTUBE_API_SERVICE_NAME, YOUTUBE_API_VERSION, developerKey=YOUTUBE_API_KEY
     )
-    req = youtube.search().list(
-        q=query,
-        part="snippet",
-        type="video",
-        order="viewCount",
-        maxResults=max_results,
-        publishedAfter=YOUTUBE_SEARCH_PUBLISHED_AFTER,
-        videoLicense="creativeCommon" if prefer_creative_commons else None,
-    )
-    # Filter out None params since google API client doesn't like None values
-    req.uri = req.uri  # force build
-    # Rebuild with filtered params
-    params = {k: v for k, v in req.uri_params.items() if v is not None}
-    req = youtube.search().list(**params)
+    kwargs = {
+        "q": query,
+        "part": "snippet",
+        "type": "video",
+        "order": "viewCount",
+        "maxResults": max_results,
+        "publishedAfter": YOUTUBE_SEARCH_PUBLISHED_AFTER,
+    }
+    if prefer_creative_commons:
+        kwargs["videoLicense"] = "creativeCommon"
+    req = youtube.search().list(**kwargs)
     res = req.execute()
     results = []
     for item in res.get("items", []):
