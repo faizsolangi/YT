@@ -3,7 +3,7 @@ import tempfile
 import time
 import re
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 import streamlit as st
 import requests
@@ -13,7 +13,7 @@ from moviepy.video.VideoClip import TextClip, ImageClip
 from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip, concatenate_videoclips
 from moviepy.audio.io.AudioFileClip import AudioFileClip
 from moviepy.video.fx.Resize import Resize as vfx_resize
-from moviepy.audio.AudioClip import CompositeAudioClip
+from moviepy.audio.AudioClip import CompositeAudioClip, AudioClip as BaseAudioClip
 import openai
 import googleapiclient.discovery
 import boto3
@@ -149,12 +149,19 @@ def llm_copyright_check(topic_title: str, context_text: str) -> Tuple[str, str]:
         return ("RISK", out) if "copyright" in out.lower() or "trademark" in out.lower() else ("SAFE", out)
 
 
-def generate_script_openai(topic: str) -> str:
+def generate_script_openai(topic: str, target_seconds: Optional[int] = None) -> str:
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     system = "You are a professional concise YouTube script writer. Produce a short script suitable for a 60-120s video."
+    length_note = ""
+    if target_seconds:
+        approx_words = max(60, int(target_seconds * 2.4))
+        length_note = (
+            f"\nAim for about {target_seconds} seconds of narration (~{approx_words} words). "
+            "Keep it tight and within that time."
+        )
     user = (
         f"Write an engaging YouTube video script for the topic: \"{topic}\".\n"
-        "- Hook (first 5-10s)\n- 3 short bullet points for main content\n- Quick summary\n- Call to action: like/subscribe\nKeep sentences short and energetic."
+        "- Hook (first 5-10s)\n- 3 short bullet points for main content\n- Quick summary\n- Call to action: like/subscribe\nKeep sentences short and energetic." + length_note
     )
     resp = client.chat.completions.create(
         model=model,
@@ -290,11 +297,39 @@ def tts_chunks_and_srt(script_text: str, temp_dir: Path, lang: str = "en") -> Tu
 # -------------------------
 # Video assembly (MoviePy)
 # -------------------------
-def build_video_from_script_and_images(script_text: str, image_urls: List[str], out_video_path: Path, title_text: str) -> Tuple[Path, Path]:
+def build_video_from_script_and_images(
+    script_text: str,
+    image_urls: List[str],
+    out_video_path: Path,
+    title_text: str,
+    target_duration_s: Optional[float] = None,
+    strict_enforce: bool = True,
+) -> Tuple[Path, Path]:
     tmpdir = Path(tempfile.mkdtemp())
 
     # Create chunked audio + SRT
     final_audio, srt_path, srt_entries = tts_chunks_and_srt(script_text, tmpdir, lang="en")
+
+    # Optionally enforce target duration on audio + SRT
+    if target_duration_s and strict_enforce:
+        dur = final_audio.duration
+        target = float(target_duration_s)
+        if dur > target:
+            # Trim audio and SRT
+            final_audio = final_audio.subclip(0, target)
+            trimmed: List[Tuple[int, float, float, str]] = []
+            for idx, start, end, text in srt_entries:
+                if start >= target:
+                    break
+                trimmed.append((idx, start, min(end, target), text))
+            srt_entries = trimmed
+        elif dur < target:
+            # Pad silence
+            pad = target - dur
+            silence = BaseAudioClip(lambda t: 0 * t, duration=pad).set_fps(44100)
+            final_audio = CompositeAudioClip([final_audio, silence.set_start(dur)])
+        # Rewrite SRT to reflect updates
+        write_srt(srt_entries, srt_path)
 
     # Download images
     image_files: List[Path] = []
@@ -325,10 +360,10 @@ def build_video_from_script_and_images(script_text: str, image_urls: List[str], 
             .on_color(size=(W, H), color=(20, 20, 20))
         )
 
-    # Build image clips
-    # Each clip duration approx = audio.duration / n_images (>= 3s)
+    # Build image clips; base durations on enforced audio duration if present
     n = len(image_files)
-    per_clip = max(3.0, final_audio.duration / max(1, n))
+    base_duration = final_audio.duration
+    per_clip = max(2.0, base_duration / max(1, n))
     clips: List[ImageClip] = []
     for idx, img in enumerate(image_files):
         clip = ImageClip(str(img)).set_duration(per_clip)
@@ -340,7 +375,6 @@ def build_video_from_script_and_images(script_text: str, image_urls: List[str], 
         x_center = (clip.w - W) // 2
         y_center = (clip.h - H) // 2
         clip = clip.crop(x1=x_center, y1=y_center, x2=x_center + W, y2=y_center + H)
-        # Subtle zoom in
         try:
             clip = vfx_resize(lambda t: 1.0 + 0.02 * (t / max(0.001, per_clip)))(clip)
         except Exception:
@@ -516,6 +550,18 @@ if "suggestions" in st.session_state:
         st.markdown(f"**{idx}) {title}**  \n_{reason}_")
     chosen = st.selectbox("Choose topic to generate script", [t for t, r in st.session_state["suggestions"]])
     st.session_state["chosen_title"] = chosen
+
+    # Length controls
+    len_col1, len_col2 = st.columns([1, 1])
+    with len_col1:
+        length_mode = st.selectbox("Length preset", ["Short (~60s)", "Custom (seconds)"])
+    with len_col2:
+        if length_mode == "Custom (seconds)":
+            target_seconds = int(st.number_input("Target length (seconds)", min_value=10, max_value=600, value=90, step=5))
+        else:
+            target_seconds = 60
+    st.session_state["target_duration_s"] = target_seconds
+
     if st.button("Run copyright & license safety check for chosen topic"):
         with st.spinner("Running safety checks..."):
             context_text = "\n".join([f"{v['title']} — {v['url']}" for v in st.session_state.get("videos", [])[:6]])
@@ -557,7 +603,7 @@ if "suggestions" in st.session_state:
             st.error("Safety mode is ON: Requires LLM SAFE and at least one creativeCommons video in the fetched list.")
         else:
             with st.spinner("Generating script..."):
-                script = generate_script_openai(chosen)
+                script = generate_script_openai(chosen, target_seconds=st.session_state.get("target_duration_s"))
                 st.session_state["script"] = script
                 st.success("Script generated.")
                 st.text_area("Generated Script", script, height=300)
@@ -582,6 +628,7 @@ if "script" in st.session_state:
                     st.error(f"Audio creation failed: {e}")
     with colB:
         num_images = st.number_input("Number of images for slideshow", min_value=2, max_value=12, value=6)
+        strict_enforce = st.checkbox("Strictly enforce target duration", value=True)
         if st.button("Assemble Video (1080p + audio)"):
             if safety_mode and not (st.session_state.get("script") and (not st.session_state.get("copyright_llm_status") or st.session_state.get("copyright_llm_status")[0] == "SAFE") and any((lic.lower() == "creativecommon") for lic in st.session_state.get("video_licenses", {}).values())):
                 st.error("Safety mode is ON: Requires LLM SAFE and at least one creativeCommons video in the fetched list.")
@@ -590,7 +637,14 @@ if "script" in st.session_state:
                     with st.spinner("Fetching images and building video..."):
                         images = pexels_search_images(niche, per_page=int(num_images))
                         tmp_video = Path(tempfile.gettempdir()) / f"{safe_file_name(st.session_state.get('script','video'))}.mp4"
-                        video_path, srt_path = build_video_from_script_and_images(st.session_state["script"], images, tmp_video, title_text=st.session_state.get("chosen_title", "" ) or safe_file_name(niche))
+                        video_path, srt_path = build_video_from_script_and_images(
+                            st.session_state["script"],
+                            images,
+                            tmp_video,
+                            title_text=st.session_state.get("chosen_title", "") or safe_file_name(niche),
+                            target_duration_s=st.session_state.get("target_duration_s"),
+                            strict_enforce=bool(strict_enforce),
+                        )
                         st.session_state["video_path"] = str(video_path)
                         st.session_state["srt_path"] = str(srt_path)
                         st.success(f"Video built: {tmp_video}")
