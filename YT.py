@@ -571,6 +571,8 @@ with st.sidebar:
     st.session_state["debug_mode"] = debug_mode
     confirm_royalty_free = st.checkbox("I confirm I will use only royalty-free/original media (e.g., Pexels, own assets)", value=False)
     st.session_state["confirm_royalty_free"] = confirm_royalty_free
+    reuse_youtube_clips = st.checkbox("I will reuse clips from fetched YouTube videos", value=False)
+    st.session_state["reuse_youtube_clips"] = reuse_youtube_clips
 
 col1, col2 = st.columns([3, 1])
 with col1:
@@ -645,15 +647,19 @@ if "suggestions" in st.session_state:
         if not safety_mode:
             return True
         llm_status = st.session_state.get("copyright_llm_status", ("RISK", ""))[0]
+        llm_safe = (llm_status == "SAFE")
+        reuse = bool(st.session_state.get("reuse_youtube_clips", False))
         licenses = st.session_state.get("video_licenses", {})
         any_cc = any((lic or "").lower() == "creativecommon" for lic in licenses.values())
-        # If user prefers CC search and fetched results exist, treat as CC present
         if st.session_state.get("prefer_cc") and st.session_state.get("videos"):
             any_cc = True
-        # If the user confirms only royalty-free/original media are used (e.g., Pexels images, gTTS audio), allow as CC-equivalent
         if st.session_state.get("confirm_royalty_free"):
             any_cc = True
-        return llm_status == "SAFE" and any_cc
+        # If not reusing YouTube clips, CC is not required; only require LLM SAFE
+        if not reuse:
+            return llm_safe
+        # If reusing YouTube clips, require both LLM SAFE and a CC source
+        return llm_safe and any_cc
 
     if st.button("Generate script for chosen topic"):
         with st.spinner("Generating script..."):
@@ -706,7 +712,15 @@ if "script" in st.session_state:
                     except Exception as e:
                         st.warning(f"Safety re-check error: {e}")
                 if safety_mode and not passes_safety_gate():
-                    st.error("Safety mode is ON: Requires LLM SAFE and at least one creativeCommons video in the fetched list. Try toggling 'Prefer Creative Commons in search' and re-fetch.")
+                    reuse = bool(st.session_state.get("reuse_youtube_clips", False))
+                    llm_status = st.session_state.get("copyright_llm_status", ("RISK", ""))[0]
+                    if not reuse:
+                        if llm_status != "SAFE":
+                            st.error("Safety mode is ON: LLM must be SAFE before assembling. Run safety check.")
+                        else:
+                            st.error("Safety mode is ON: Policy blocked. Disable Safety mode to proceed.")
+                    else:
+                        st.error("Safety mode is ON: To reuse YouTube clips, requires LLM SAFE and at least one creativeCommons source. Toggle 'Prefer Creative Commons in search', re-fetch, or uncheck 'reuse YouTube clips'.")
                     st.stop()
             try:
                 with st.spinner("Fetching images and building video..."):
