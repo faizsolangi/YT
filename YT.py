@@ -19,7 +19,6 @@ from pytrends.request import TrendReq
 
 # MoviePy submodule imports (avoid moviepy.editor for compatibility)
 from moviepy.video.VideoClip import TextClip, ImageClip
-from moviepy.video.compositing.concatenate import concatenate_videoclips
 from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip
 from moviepy.audio.io.AudioFileClip import AudioFileClip
 from moviepy.audio.AudioClip import AudioArrayClip
@@ -471,8 +470,8 @@ def build_video_from_script_and_images(
         clip = ImageClip(frame, duration=per_clip)
         clips.append(clip)
 
-    slideshow = concatenate_videoclips(clips, method="compose")
-    full = concatenate_videoclips([title_clip, slideshow], method="compose")
+    slideshow = concatenate_videoclips_simple(clips, size=(W, H))
+    full = concatenate_videoclips_simple([title_clip, slideshow], size=(W, H))
 
     # Ensure visual length >= audio; pad last frame if needed
     if full.duration < final_audio.duration:
@@ -483,7 +482,7 @@ def build_video_from_script_and_images(
         except Exception:
             frame = pillow_fit_center_crop(str(image_files[-1]), W, H)
         last_pad = ImageClip(frame, duration=leftover)
-        full = concatenate_videoclips([full, last_pad], method="compose")
+        full = concatenate_videoclips_simple([full, last_pad], size=(W, H))
 
     final = full.set_audio(final_audio).set_duration(final_audio.duration)
 
