@@ -18,7 +18,7 @@ from openai import OpenAI
 from pytrends.request import TrendReq
 
 # MoviePy submodule imports (avoid moviepy.editor for compatibility)
-from moviepy.video.VideoClip import TextClip, ImageClip
+from moviepy.video.VideoClip import TextClip, ImageClip, VideoClip
 from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip
 from moviepy.audio.io.AudioFileClip import AudioFileClip
 from moviepy.audio.AudioClip import AudioArrayClip
@@ -58,18 +58,30 @@ YOUTUBE_SEARCH_PUBLISHED_AFTER = os.getenv("YOUTUBE_SEARCH_PUBLISHED_AFTER", "20
 def concatenate_videoclips_simple(clips, size=None):
     if not clips:
         raise ValueError("No clips to concatenate")
-    start_time = 0.0
-    arranged = []
-    for c in clips:
-        duration = float(getattr(c, "duration", 0) or 0)
-        arranged.append(c.set_start(start_time))
-        start_time += duration
-    if size is None:
-        w = getattr(clips[0], "w", None)
-        h = getattr(clips[0], "h", None)
-        size = (w, h) if (w and h) else None
-    comp = CompositeVideoClip(arranged, size=size)
-    return comp.set_duration(start_time)
+    durations = [float(getattr(c, "duration", 0) or 0) for c in clips]
+    total_duration = float(sum(durations))
+
+    def make_frame(t):
+        if t <= 0:
+            return clips[0].get_frame(0)
+        if t >= total_duration:
+            # guard for exact end
+            return clips[-1].get_frame(max(0.0, durations[-1] - 1e-6))
+        acc = 0.0
+        for i, d in enumerate(durations):
+            if t < acc + d:
+                return clips[i].get_frame(t - acc)
+            acc += d
+        return clips[-1].get_frame(max(0.0, durations[-1] - 1e-6))
+
+    composite = VideoClip(make_frame=make_frame, duration=total_duration)
+    # Let writer infer size from first frame; optionally set size if provided
+    if size and len(size) == 2 and all(size):
+        try:
+            composite.w, composite.h = size[0], size[1]
+        except Exception:
+            pass
+    return composite
 
 
 def safe_file_name(s: str) -> str:
