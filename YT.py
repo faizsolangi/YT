@@ -503,7 +503,12 @@ def build_video_from_script_and_images(
 
     video = ImageSequenceClip(frames, durations=durations)
 
-    final = video.set_audio(final_audio)
+    try:
+        final = video.set_audio(final_audio)
+    except Exception:
+        # Fallback for environments missing set_audio on clips
+        video.audio = final_audio
+        final = video
 
     final.write_videofile(
         str(out_video_path),
