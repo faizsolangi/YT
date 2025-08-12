@@ -1,0 +1,7 @@
+streamlit
+google-api-python-client
+openai
+pillow
+moviepy
+requests
+python-dotenv
