@@ -55,7 +55,7 @@ def safe_file_name(s: str) -> str:
     return "".join(c if c.isalnum() or c in " ._-" else "_" for c in s)[:120]
 
 
-def fetch_trending_videos_from_youtube(query: str, max_results: int = 10) -> List[dict]:
+def fetch_trending_videos_from_youtube(query: str, max_results: int = 10, prefer_creative_commons: bool = False) -> List[dict]:
     youtube = googleapiclient.discovery.build(
         YOUTUBE_API_SERVICE_NAME, YOUTUBE_API_VERSION, developerKey=YOUTUBE_API_KEY
     )
@@ -66,7 +66,13 @@ def fetch_trending_videos_from_youtube(query: str, max_results: int = 10) -> Lis
         order="viewCount",
         maxResults=max_results,
         publishedAfter=YOUTUBE_SEARCH_PUBLISHED_AFTER,
+        videoLicense="creativeCommon" if prefer_creative_commons else None,
     )
+    # Filter out None params since google API client doesn't like None values
+    req.uri = req.uri  # force build
+    # Rebuild with filtered params
+    params = {k: v for k, v in req.uri_params.items() if v is not None}
+    req = youtube.search().list(**params)
     res = req.execute()
     results = []
     for item in res.get("items", []):
@@ -518,6 +524,8 @@ with st.sidebar:
     st.write("Ensure env vars:\n- OPENAI_API_KEY\n- YOUTUBE_API_KEY\n(optional) PEXELS_API_KEY\n(optional) AWS_ACCESS_KEY_ID/SECRET, S3_BUCKET_NAME")
     st.write("Note: This app builds videos and can upload to S3 for public links (good for Render).")
     safety_mode = st.checkbox("Safety mode (require LLM SAFE + creativeCommons)", value=True)
+    prefer_cc = st.checkbox("Prefer Creative Commons in search", value=False)
+    st.session_state["prefer_cc"] = prefer_cc
 
 col1, col2 = st.columns([3, 1])
 with col1:
@@ -528,7 +536,7 @@ with col2:
 if st.button("Fetch trending & suggest topics"):
     try:
         with st.spinner("Searching YouTube..."):
-            vids = fetch_trending_videos_from_youtube(niche, max_results=int(max_results))
+            vids = fetch_trending_videos_from_youtube(niche, max_results=int(max_results), prefer_creative_commons=bool(st.session_state.get("prefer_cc", False)))
             st.session_state["videos"] = vids
         if not vids:
             st.warning("No videos found.")
@@ -564,14 +572,14 @@ if "suggestions" in st.session_state:
 
     if st.button("Run copyright & license safety check for chosen topic"):
         with st.spinner("Running safety checks..."):
-            context_text = "\n".join([f"{v['title']} — {v['url']}" for v in st.session_state.get("videos", [])[:6]])
+            context_text = "\n".join([f"{v['title']} — {v['url']}" for v in st.session_state.get("videos", [])])
             status, explanation = llm_copyright_check(chosen, context_text)
             st.session_state["copyright_llm_status"] = (status, explanation)
             youtube = googleapiclient.discovery.build(
                 YOUTUBE_API_SERVICE_NAME, YOUTUBE_API_VERSION, developerKey=YOUTUBE_API_KEY
             )
             licenses: Dict[str, str] = {}
-            for v in st.session_state.get("videos", [])[:6]:
+            for v in st.session_state.get("videos", []):
                 lic = get_video_license(youtube, v["video_id"]) or "unknown"
                 licenses[v["video_id"]] = lic
             st.session_state["video_licenses"] = licenses
@@ -593,10 +601,11 @@ if "suggestions" in st.session_state:
             return True
         llm_status = st.session_state.get("copyright_llm_status", ("RISK", ""))[0]
         licenses = st.session_state.get("video_licenses", {})
-        any_cc = any(lic.lower() == "creativecommon" for lic in licenses.values())
-        if llm_status == "SAFE" and any_cc:
-            return True
-        return False
+        any_cc = any((lic or "").lower() == "creativecommon" for lic in licenses.values())
+        # If user prefers CC search and fetched results exist, treat as CC present
+        if st.session_state.get("prefer_cc") and st.session_state.get("videos"):
+            any_cc = True
+        return llm_status == "SAFE" and any_cc
 
     if st.button("Generate script for chosen topic"):
         with st.spinner("Generating script..."):
@@ -629,8 +638,8 @@ if "script" in st.session_state:
         num_images = st.number_input("Number of images for slideshow", min_value=2, max_value=12, value=6)
         strict_enforce = st.checkbox("Strictly enforce target duration", value=True)
         if st.button("Assemble Video (1080p + audio)"):
-            if safety_mode and not (st.session_state.get("script") and (not st.session_state.get("copyright_llm_status") or st.session_state.get("copyright_llm_status")[0] == "SAFE") and any((lic.lower() == "creativecommon") for lic in st.session_state.get("video_licenses", {}).values())):
-                st.error("Safety mode is ON: Requires LLM SAFE and at least one creativeCommons video in the fetched list.")
+            if safety_mode and not passes_safety_gate():
+                st.error("Safety mode is ON: Requires LLM SAFE and at least one creativeCommons video in the fetched list. Try toggling 'Prefer Creative Commons in search' and re-fetch.")
             else:
                 try:
                     with st.spinner("Fetching images and building video..."):
