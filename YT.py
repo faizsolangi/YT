@@ -269,7 +269,31 @@ def text_to_speech_gtts(text: str, out_path: Path, lang: str = "en"):
     return out_path
 
 
+# -------------------------
+# Text cleaning for TTS
+# -------------------------
+STAGE_KEYWORDS = r"music|sfx|sound|beat|applause|transition|intro|outro|fx|bgm|beatdrop|whoosh|ding|sting"
+
+def clean_script_for_tts(text: str) -> str:
+    if not text:
+        return ""
+    # Remove markdown emphasis and headers/bullets
+    text = re.sub(r"[*_#`]+", " ", text)
+    text = re.sub(r"^\s*[-•]+\s+", "", text, flags=re.MULTILINE)
+    # Remove bracketed stage directions like [INTRO], [SFX], [Hook]
+    text = re.sub(r"\[[^\]]*\]", " ", text)
+    # Remove parenthetical stage directions that include known keywords
+    text = re.sub(r"\((?:(?:(?i)(?:" + STAGE_KEYWORDS + r"))[^)]*)\)", " ", text)
+    # Also remove standalone lines that are likely cues (all caps short lines)
+    text = re.sub(r"^\s*[A-Z ]{3,20}:?\s*$", " ", text, flags=re.MULTILINE)
+    # Collapse spaces
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def tts_chunks_and_srt(script_text: str, temp_dir: Path, lang: str = "en") -> Tuple[AudioArrayClip, Path, List[Tuple[int, float, float, str]]]:
+    # Clean stage directions before chunking/tts
+    script_text = clean_script_for_tts(script_text)
     chunks = split_text_into_chunks(script_text, max_chars=180)
     if not chunks:
         raise RuntimeError("No text to synthesize.")
@@ -319,7 +343,7 @@ def build_video_from_script_and_images(
 ) -> Tuple[Path, Path]:
     tmpdir = Path(tempfile.mkdtemp())
 
-    # Create chunked audio + SRT
+    # Create chunked audio + SRT (cleaned inside)
     final_audio, srt_path, srt_entries = tts_chunks_and_srt(script_text, tmpdir, lang="en")
 
     # Optionally enforce target duration on audio + SRT using array ops (avoid set_start/subclip)
@@ -642,8 +666,9 @@ if "script" in st.session_state:
                     tmpdir = Path(tempfile.gettempdir())
                     base = safe_file_name(st.session_state.get("script", "script"))
                     temp_audio = Path(tmpdir) / f"{base}_narration.mp3"
-                    # Build once to persist files (the video builder also runs this, but we expose it here for downloads)
-                    audio_clip, srt_path, _ = tts_chunks_and_srt(st.session_state["script"], Path(tempfile.mkdtemp()))
+                    # Use cleaned text
+                    cleaned = clean_script_for_tts(st.session_state["script"])
+                    audio_clip, srt_path, _ = tts_chunks_and_srt(cleaned, Path(tempfile.mkdtemp()))
                     audio_clip.write_audiofile(str(temp_audio))
                     st.session_state["audio_path"] = str(temp_audio)
                     st.session_state["srt_path"] = str(srt_path)
@@ -655,24 +680,42 @@ if "script" in st.session_state:
         strict_enforce = st.checkbox("Strictly enforce target duration", value=True)
         if st.button("Assemble Video (1080p + audio)"):
             if safety_mode and not passes_safety_gate():
-                st.error("Safety mode is ON: Requires LLM SAFE and at least one creativeCommons video in the fetched list. Try toggling 'Prefer Creative Commons in search' and re-fetch.")
-            else:
-                try:
-                    with st.spinner("Fetching images and building video..."):
-                        images = pexels_search_images(niche, per_page=int(num_images))
-                        tmp_video = Path(tempfile.gettempdir()) / f"{safe_file_name(st.session_state.get('script','video'))}.mp4"
-                        video_path, srt_path = build_video_from_script_and_images(
-                            st.session_state["script"],
-                            images,
-                            tmp_video,
-                            title_text=st.session_state.get("chosen_title", "") or safe_file_name(niche),
-                            target_duration_s=st.session_state.get("target_duration_s"),
-                            strict_enforce=bool(strict_enforce),
-                        )
-                        st.session_state["video_path"] = str(video_path)
-                        st.session_state["srt_path"] = str(srt_path)
-                        st.success(f"Video built: {tmp_video}")
-                        st.video(str(tmp_video))
+                # Auto-run safety checks once if missing, then retry gate
+                if "copyright_llm_status" not in st.session_state or "video_licenses" not in st.session_state:
+                    try:
+                        with st.spinner("Running safety checks..."):
+                            context_text = "\n".join([f"{v['title']} — {v['url']}" for v in st.session_state.get("videos", [])])
+                            status, explanation = llm_copyright_check(st.session_state.get("chosen_title") or chosen, context_text)
+                            st.session_state["copyright_llm_status"] = (status, explanation)
+                            youtube = googleapiclient.discovery.build(
+                                YOUTUBE_API_SERVICE_NAME, YOUTUBE_API_VERSION, developerKey=YOUTUBE_API_KEY
+                            )
+                            licenses: Dict[str, str] = {}
+                            for v in st.session_state.get("videos", []):
+                                lic = get_video_license(youtube, v["video_id"]) or "unknown"
+                                licenses[v["video_id"]] = lic
+                            st.session_state["video_licenses"] = licenses
+                    except Exception as e:
+                        st.warning(f"Safety re-check error: {e}")
+                if safety_mode and not passes_safety_gate():
+                    st.error("Safety mode is ON: Requires LLM SAFE and at least one creativeCommons video in the fetched list. Try toggling 'Prefer Creative Commons in search' and re-fetch.")
+                    st.stop()
+            try:
+                with st.spinner("Fetching images and building video..."):
+                    images = pexels_search_images(niche, per_page=int(num_images))
+                    tmp_video = Path(tempfile.gettempdir()) / f"{safe_file_name(st.session_state.get('script','video'))}.mp4"
+                    video_path, srt_path = build_video_from_script_and_images(
+                        st.session_state["script"],
+                        images,
+                        tmp_video,
+                        title_text=st.session_state.get("chosen_title", "") or safe_file_name(niche),
+                        target_duration_s=st.session_state.get("target_duration_s"),
+                        strict_enforce=bool(strict_enforce),
+                    )
+                    st.session_state["video_path"] = str(video_path)
+                    st.session_state["srt_path"] = str(srt_path)
+                    st.success(f"Video built: {tmp_video}")
+                    st.video(str(tmp_video))
                 except Exception as e:
                     st.error(f"Video assembly failed: {e}")
                     if st.session_state.get("debug_mode"):
