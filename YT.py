@@ -274,6 +274,9 @@ def text_to_speech_gtts(text: str, out_path: Path, lang: str = "en"):
 # -------------------------
 STAGE_KEYWORDS = r"music|sfx|sound|beat|applause|transition|intro|outro|fx|bgm|beatdrop|whoosh|ding|sting"
 
+PAREN_STAGE_RE = re.compile(r"\((?:[^)]*(?:" + STAGE_KEYWORDS + r")[^)]*)\)", flags=re.IGNORECASE)
+
+
 def clean_script_for_tts(text: str) -> str:
     if not text:
         return ""
@@ -283,7 +286,7 @@ def clean_script_for_tts(text: str) -> str:
     # Remove bracketed stage directions like [INTRO], [SFX], [Hook]
     text = re.sub(r"\[[^\]]*\]", " ", text)
     # Remove parenthetical stage directions that include known keywords
-    text = re.sub(r"\((?:(?:(?i)(?:" + STAGE_KEYWORDS + r"))[^)]*)\)", " ", text)
+    text = PAREN_STAGE_RE.sub(" ", text)
     # Also remove standalone lines that are likely cues (all caps short lines)
     text = re.sub(r"^\s*[A-Z ]{3,20}:?\s*$", " ", text, flags=re.MULTILINE)
     # Collapse spaces
