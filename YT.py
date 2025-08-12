@@ -22,6 +22,7 @@ from moviepy.video.VideoClip import TextClip, ImageClip, VideoClip
 from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip
 from moviepy.audio.io.AudioFileClip import AudioFileClip
 from moviepy.audio.AudioClip import AudioArrayClip
+from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
 
 # -------------------------
 # Config & env variables
@@ -377,8 +378,8 @@ def pillow_fit_center_crop(img_path: str, width: int, height: int) -> np.ndarray
         return np.array(im)
 
 
-def _pillow_title_clip(title_text: str, width: int, height: int, duration: float = 3.0,
-                       bg_color=(20, 20, 20), font_color=(255, 255, 255)):
+def _pillow_title_frame(title_text: str, width: int, height: int,
+                        bg_color=(20, 20, 20), font_color=(255, 255, 255)) -> np.ndarray:
     try:
         font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", 96)
     except Exception:
@@ -414,7 +415,7 @@ def _pillow_title_clip(title_text: str, width: int, height: int, duration: float
         draw.text(((width - tw) / 2, y), line, font=font_title, fill=font_color)
         y += line_height
 
-    return ImageClip(np.array(img), duration=duration)
+    return np.array(img)
 
 
 # -------------------------
@@ -473,48 +474,36 @@ def build_video_from_script_and_images(
     # Parameters for 1080p
     W, H = 1920, 1080
 
-    # Title clip (3s) at 1080p
-    try:
-        title_clip = (
-            TextClip(title_text, fontsize=80, color="white", size=(W, H), method="caption", font="DejaVu-Sans-Bold")
-            .set_duration(3)
-            .on_color(size=(W, H), color=(20, 20, 20))
-        )
-    except Exception:
-        try:
-            title_clip = (
-                TextClip(title_text, fontsize=60, color="white", size=(W, H), method="caption")
-                .set_duration(3)
-                .on_color(size=(W, H), color=(20, 20, 20))
-            )
-        except Exception:
-            title_clip = _pillow_title_clip(title_text, W, H, duration=3.0)
+    # Title frame (3s) at 1080p using Pillow
+    title_duration = 3.0
+    title_frame = _pillow_title_frame(title_text, W, H)
 
-    # Build image clips; base durations on enforced audio duration if present
+    # Build image frames; base durations on enforced audio duration if present
     n = len(image_files)
     base_duration = final_audio.duration
     per_clip = max(2.0, base_duration / max(1, n))
-    clips: List[ImageClip] = []
+
+    frames: List[np.ndarray] = [title_frame]
+    durations: List[float] = [title_duration]
+
     for idx, img in enumerate(image_files):
         frame = pillow_fit_center_crop(str(img), W, H)
-        clip = ImageClip(frame, duration=per_clip)
-        clips.append(clip)
+        frames.append(frame)
+        durations.append(per_clip)
 
-    slideshow = concatenate_videoclips_simple(clips, size=(W, H))
-    full = concatenate_videoclips_simple([title_clip, slideshow], size=(W, H))
+    # Adjust last duration to match audio length exactly
+    total_dur = float(sum(durations))
+    audio_dur = float(final_audio.duration)
+    if abs(total_dur - audio_dur) > 1e-3:
+        if total_dur < audio_dur:
+            durations[-1] += (audio_dur - total_dur)
+        else:
+            excess = total_dur - audio_dur
+            durations[-1] = max(0.1, durations[-1] - excess)
 
-    # Ensure visual length >= audio; pad last frame if needed
-    if full.duration < final_audio.duration:
-        leftover = final_audio.duration - full.duration
-        last_src = clips[-1]
-        try:
-            frame = last_src.get_frame(max(0.0, (last_src.duration or 0) - 1e-3))
-        except Exception:
-            frame = pillow_fit_center_crop(str(image_files[-1]), W, H)
-        last_pad = ImageClip(frame, duration=leftover)
-        full = concatenate_videoclips_simple([full, last_pad], size=(W, H))
+    video = ImageSequenceClip(frames, durations=durations)
 
-    final = full.set_audio(final_audio).set_duration(final_audio.duration)
+    final = video.set_audio(final_audio)
 
     final.write_videofile(
         str(out_video_path),
