@@ -599,14 +599,13 @@ if "suggestions" in st.session_state:
         return False
 
     if st.button("Generate script for chosen topic"):
+        with st.spinner("Generating script..."):
+            script = generate_script_openai(chosen, target_seconds=st.session_state.get("target_duration_s"))
+            st.session_state["script"] = script
+            st.success("Script generated.")
+            st.text_area("Generated Script", script, height=300)
         if safety_mode and not passes_safety_gate():
-            st.error("Safety mode is ON: Requires LLM SAFE and at least one creativeCommons video in the fetched list.")
-        else:
-            with st.spinner("Generating script..."):
-                script = generate_script_openai(chosen, target_seconds=st.session_state.get("target_duration_s"))
-                st.session_state["script"] = script
-                st.success("Script generated.")
-                st.text_area("Generated Script", script, height=300)
+            st.warning("Safety mode is ON: You can generate a script, but video assembly requires LLM SAFE and at least one creativeCommons result.")
 
 if "script" in st.session_state:
     st.subheader("Create audio, video, subtitles, and thumbnail")
