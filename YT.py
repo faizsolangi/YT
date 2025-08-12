@@ -12,9 +12,6 @@ from PIL import Image, ImageDraw, ImageFont
 from moviepy.video.VideoClip import TextClip, ImageClip
 from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip, concatenate_videoclips
 from moviepy.audio.io.AudioFileClip import AudioFileClip
-from moviepy.video.fx.Resize import Resize as vfx_resize
-from moviepy.video.fx.resize import resize as vfx_resize
-from moviepy.video.fx.crop import crop as vfx_crop
 from moviepy.audio.AudioClip import CompositeAudioClip, AudioClip as BaseAudioClip, AudioArrayClip
 import numpy as np
 import traceback
@@ -296,6 +293,25 @@ def clean_script_for_tts(text: str) -> str:
     return text
 
 
+def pillow_fit_center_crop(img_path: str, width: int, height: int) -> np.ndarray:
+    with Image.open(img_path) as im:
+        im = im.convert("RGB")
+        src_w, src_h = im.size
+        target_ratio = width / height
+        src_ratio = src_w / src_h
+        if src_ratio >= target_ratio:
+            new_h = height
+            new_w = int(src_ratio * new_h)
+        else:
+            new_w = width
+            new_h = int(new_w / src_ratio)
+        im = im.resize((new_w, new_h), Image.LANCZOS)
+        left = (new_w - width) // 2
+        top = (new_h - height) // 2
+        im = im.crop((left, top, left + width, top + height))
+        return np.array(im)
+
+
 def tts_chunks_and_srt(script_text: str, temp_dir: Path, lang: str = "en") -> Tuple[AudioArrayClip, Path, List[Tuple[int, float, float, str]]]:
     # Clean stage directions before chunking/tts
     script_text = clean_script_for_tts(script_text)
@@ -459,24 +475,14 @@ def build_video_from_script_and_images(
     clips: List[ImageClip] = []
     for idx, img in enumerate(image_files):
         # Duration passed in constructor; avoid set_duration on ImageClip
-        clip = ImageClip(str(img), duration=per_clip)
+                # Resize preserving aspect to cover, then center crop to 1080p
+        img_arr = pillow_fit_center_crop(str(img), W, H)
+	clip = ImageClip(img_arr, duration=per_clip)
+	clips.append(clip)
+       
 
-        # Resize preserving aspect to cover, then center crop to 1080p
-        if clip.w / clip.h >= W / H:
-            clip = vfx_resize(clip, height=H)
-        else:
-            clip = vfx_resize(clip, width=W)
-        x_center = int((clip.w - W) // 2)
-        y_center = int((clip.h - H) // 2)
-        clip = vfx_crop(clip, x1=x_center, y1=y_center, x2=x_center + W, y2=y_center + H)
 
-        # Subtle Ken Burns zoom (use method API, not vfx import)
-        try:
-            clip = vfx_resize(clip, lambda t: 1.0 + 0.02 * (t / max(0.001, per_clip)))
-        except Exception:
-            pass
 
-        clips.append(clip)
 
     slideshow = concatenate_videoclips(clips, method="compose")
     full = concatenate_videoclips([title_clip, slideshow], method="compose")
