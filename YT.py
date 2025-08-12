@@ -22,6 +22,12 @@ import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from openai import OpenAI
 
+try:
+    from pydub import AudioSegment  # optional, for robust MP3 decoding
+    _HAS_PYDUB = True
+except Exception:
+    _HAS_PYDUB = False
+
 # -------------------------
 # Config & env variables
 # -------------------------
@@ -294,6 +300,42 @@ def clean_script_for_tts(text: str) -> str:
     return text
 
 
+def audiofile_to_array_safe(file_path: str, fps: int = 44100) -> np.ndarray:
+    """Decode an audio file (mp3) into a float32 numpy array of shape (samples, 2) at given fps.
+    Prefers pydub for robustness; falls back to MoviePy with epsilon trimming to avoid boundary errors.
+    """
+    try:
+        if _HAS_PYDUB:
+            seg = AudioSegment.from_file(file_path)
+            seg = seg.set_frame_rate(fps).set_channels(2).set_sample_width(2)  # 16-bit stereo
+            raw = seg.get_array_of_samples()
+            arr = np.array(raw).astype(np.float32) / 32768.0
+            arr = arr.reshape((-1, 2))
+            return arr
+        else:
+            clip = AudioFileClip(file_path)
+            try:
+                dur = float(clip.duration or 0.0)
+                if dur <= 0:
+                    return np.zeros((0, 2), dtype=np.float32)
+                # Trim a tiny epsilon at the end to avoid boundary read
+                epsilon = 1.0 / fps
+                end = max(0.0, dur - epsilon)
+                sub = clip.subclip(0, end) if end > 0 else clip.subclip(0, dur)
+                arr = sub.to_soundarray(fps=fps)
+                if arr.ndim == 1:
+                    arr = np.stack([arr, arr], axis=1)
+                return arr.astype(np.float32)
+            finally:
+                try:
+                    clip.close()
+                except Exception:
+                    pass
+    except Exception:
+        # As a last resort, return empty audio
+        return np.zeros((0, 2), dtype=np.float32)
+
+
 def tts_chunks_and_srt(script_text: str, temp_dir: Path, lang: str = "en") -> Tuple[AudioArrayClip, Path, List[Tuple[int, float, float, str]]]:
     # Clean stage directions before chunking/tts
     script_text = clean_script_for_tts(script_text)
@@ -309,22 +351,16 @@ def tts_chunks_and_srt(script_text: str, temp_dir: Path, lang: str = "en") -> Tu
     for idx, chunk in enumerate(chunks, start=1):
         path = temp_dir / f"tts_{idx:03d}.mp3"
         text_to_speech_gtts(chunk, path, lang=lang)
-        clip = AudioFileClip(str(path))
-        try:
-            arr = clip.to_soundarray(fps=fps)
-            if arr.ndim == 1:
-                arr = np.stack([arr, arr], axis=1)
-            n_channels = arr.shape[1]
-            audio_arrays.append(arr)
-            start = cursor
-            end = cursor + clip.duration
-            srt_entries.append((idx, start, end, chunk))
-            cursor = end
-        finally:
-            try:
-                clip.close()
-            except Exception:
-                pass
+        arr = audiofile_to_array_safe(str(path), fps=fps)
+        if arr.size == 0:
+            continue
+        n_channels = arr.shape[1]
+        audio_arrays.append(arr)
+        length_s = arr.shape[0] / float(fps)
+        start = cursor
+        end = cursor + length_s
+        srt_entries.append((idx, start, end, chunk))
+        cursor = end
 
     final_array = np.concatenate(audio_arrays, axis=0) if audio_arrays else np.zeros((1, n_channels), dtype=np.float32)
     final_audio = AudioArrayClip(final_array, fps=fps)
