@@ -13,7 +13,8 @@ from moviepy.video.VideoClip import TextClip, ImageClip
 from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip, concatenate_videoclips
 from moviepy.audio.io.AudioFileClip import AudioFileClip
 from moviepy.video.fx.Resize import Resize as vfx_resize
-from moviepy.audio.AudioClip import CompositeAudioClip, AudioClip as BaseAudioClip
+from moviepy.audio.AudioClip import CompositeAudioClip, AudioClip as BaseAudioClip, AudioArrayClip
+import numpy as np
 import openai
 import googleapiclient.discovery
 import boto3
@@ -267,31 +268,38 @@ def text_to_speech_gtts(text: str, out_path: Path, lang: str = "en"):
     return out_path
 
 
-def tts_chunks_and_srt(script_text: str, temp_dir: Path, lang: str = "en") -> Tuple[AudioFileClip, Path, List[Tuple[int, float, float, str]]]:
+def tts_chunks_and_srt(script_text: str, temp_dir: Path, lang: str = "en") -> Tuple[AudioArrayClip, Path, List[Tuple[int, float, float, str]]]:
     chunks = split_text_into_chunks(script_text, max_chars=180)
     if not chunks:
         raise RuntimeError("No text to synthesize.")
 
-    audio_clips: List[AudioFileClip] = []
+    audio_arrays: List[np.ndarray] = []
     srt_entries: List[Tuple[int, float, float, str]] = []
     cursor = 0.0
+    fps = 44100
+    n_channels = 2
     for idx, chunk in enumerate(chunks, start=1):
         path = temp_dir / f"tts_{idx:03d}.mp3"
         text_to_speech_gtts(chunk, path, lang=lang)
         clip = AudioFileClip(str(path))
-        start = cursor
-        end = cursor + clip.duration
-        srt_entries.append((idx, start, end, chunk))
-        audio_clips.append(clip)
-        cursor = end
+        try:
+            arr = clip.to_soundarray(fps=fps)
+            if arr.ndim == 1:
+                arr = np.stack([arr, arr], axis=1)
+            n_channels = arr.shape[1]
+            audio_arrays.append(arr)
+            start = cursor
+            end = cursor + clip.duration
+            srt_entries.append((idx, start, end, chunk))
+            cursor = end
+        finally:
+            try:
+                clip.close()
+            except Exception:
+                pass
 
-    # MoviePy 2.x lacks helper; manually concatenate via CompositeAudioClip + set_start
-    cursor = 0.0
-    positioned = []
-    for ac in audio_clips:
-        positioned.append(ac.set_start(cursor))
-        cursor += ac.duration
-    final_audio = CompositeAudioClip(positioned)
+    final_array = np.concatenate(audio_arrays, axis=0) if audio_arrays else np.zeros((1, n_channels), dtype=np.float32)
+    final_audio = AudioArrayClip(final_array, fps=fps)
     srt_path = temp_dir / "subtitles.srt"
     write_srt(srt_entries, srt_path)
     return final_audio, srt_path, srt_entries
@@ -313,25 +321,30 @@ def build_video_from_script_and_images(
     # Create chunked audio + SRT
     final_audio, srt_path, srt_entries = tts_chunks_and_srt(script_text, tmpdir, lang="en")
 
-    # Optionally enforce target duration on audio + SRT
+    # Optionally enforce target duration on audio + SRT using array ops (avoid set_start/subclip)
     if target_duration_s and strict_enforce:
-        dur = final_audio.duration
-        target = float(target_duration_s)
-        if dur > target:
-            # Trim audio and SRT
-            final_audio = final_audio.subclip(0, target)
+        fps = 44100
+        arr = final_audio.to_soundarray(fps=fps)
+        if arr.ndim == 1:
+            arr = np.stack([arr, arr], axis=1)
+        cur_samples = arr.shape[0]
+        target_samples = int(float(target_duration_s) * fps)
+        if cur_samples > target_samples:
+            arr = arr[:target_samples]
+            # Trim SRT
+            target = float(target_duration_s)
             trimmed: List[Tuple[int, float, float, str]] = []
             for idx, start, end, text in srt_entries:
                 if start >= target:
                     break
                 trimmed.append((idx, start, min(end, target), text))
             srt_entries = trimmed
-        elif dur < target:
-            # Pad silence
-            pad = target - dur
-            silence = BaseAudioClip(lambda t: 0 * t, duration=pad).set_fps(44100)
-            final_audio = CompositeAudioClip([final_audio, silence.set_start(dur)])
-        # Rewrite SRT to reflect updates
+        elif cur_samples < target_samples:
+            pad = target_samples - cur_samples
+            n_channels = arr.shape[1] if arr.ndim == 2 else 2
+            pad_arr = np.zeros((pad, n_channels), dtype=arr.dtype)
+            arr = np.concatenate([arr, pad_arr], axis=0)
+        final_audio = AudioArrayClip(arr, fps=fps)
         write_srt(srt_entries, srt_path)
 
     # Download images
