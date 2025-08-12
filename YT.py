@@ -54,6 +54,24 @@ YOUTUBE_SEARCH_PUBLISHED_AFTER = os.getenv("YOUTUBE_SEARCH_PUBLISHED_AFTER", "20
 # -------------------------
 # Helper utilities
 # -------------------------
+
+def concatenate_videoclips_simple(clips, size=None):
+    if not clips:
+        raise ValueError("No clips to concatenate")
+    start_time = 0.0
+    arranged = []
+    for c in clips:
+        duration = float(getattr(c, "duration", 0) or 0)
+        arranged.append(c.set_start(start_time))
+        start_time += duration
+    if size is None:
+        w = getattr(clips[0], "w", None)
+        h = getattr(clips[0], "h", None)
+        size = (w, h) if (w and h) else None
+    comp = CompositeVideoClip(arranged, size=size)
+    return comp.set_duration(start_time)
+
+
 def safe_file_name(s: str) -> str:
     return "".join(c if c.isalnum() or c in " ._-" else "_" for c in s)[:120]
 
