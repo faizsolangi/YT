@@ -1,25 +1,28 @@
 import os
 import tempfile
-import time
 import re
+import json
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Any
 
 import streamlit as st
 import requests
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont
-from moviepy.video.VideoClip import TextClip, ImageClip
-from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip, concatenate_videoclips
-from moviepy.audio.io.AudioFileClip import AudioFileClip
-from moviepy.audio.AudioClip import CompositeAudioClip, AudioClip as BaseAudioClip, AudioArrayClip
 import numpy as np
 import traceback
-import openai
 import googleapiclient.discovery
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from openai import OpenAI
+from pytrends.request import TrendReq
+
+# MoviePy submodule imports (avoid moviepy.editor for compatibility)
+from moviepy.video.VideoClip import TextClip, ImageClip
+from moviepy.video.compositing.concatenate import concatenate_videoclips
+from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip
+from moviepy.audio.io.AudioFileClip import AudioFileClip
+from moviepy.audio.AudioClip import AudioArrayClip
 
 # -------------------------
 # Config & env variables
@@ -218,7 +221,6 @@ def split_text_into_chunks(text: str, max_chars: int = 180) -> List[str]:
     text = re.sub(r"\s+", " ", text.strip())
     if not text:
         return []
-    # Split into sentences using simple regex
     sentences = re.split(r"(?<=[.!?])\s+", text)
     chunks: List[str] = []
     current = ""
@@ -231,7 +233,6 @@ def split_text_into_chunks(text: str, max_chars: int = 180) -> List[str]:
             if len(sent) <= max_chars:
                 current = sent
             else:
-                # Hard wrap long sentences
                 for i in range(0, len(sent), max_chars):
                     chunk = sent[i : i + max_chars]
                     if chunk:
@@ -243,7 +244,6 @@ def split_text_into_chunks(text: str, max_chars: int = 180) -> List[str]:
 
 
 def write_srt(srt_entries: List[Tuple[int, float, float, str]], out_path: Path) -> Path:
-    # entries: (index starting at 1, start_sec, end_sec, text)
     def fmt_time(sec: float) -> str:
         millis = int(round((sec - int(sec)) * 1000))
         sec = int(sec)
@@ -273,47 +273,22 @@ def text_to_speech_gtts(text: str, out_path: Path, lang: str = "en"):
 # -------------------------
 STAGE_KEYWORDS = r"music|sfx|sound|beat|applause|transition|intro|outro|fx|bgm|beatdrop|whoosh|ding|sting"
 
-PAREN_STAGE_RE = re.compile(r"\((?:[^)]]*(?:" + STAGE_KEYWORDS + r")[^)]*)\)", flags=re.IGNORECASE)
+PAREN_STAGE_RE = re.compile(r"\((?:[^)]*(?:" + STAGE_KEYWORDS + r")[^)]*)\)", flags=re.IGNORECASE)
 
 
 def clean_script_for_tts(text: str) -> str:
     if not text:
         return ""
-    # Remove markdown emphasis and headers/bullets
     text = re.sub(r"[*_#`]+", " ", text)
     text = re.sub(r"^\s*[-•]+\s+", "", text, flags=re.MULTILINE)
-    # Remove bracketed stage directions like [INTRO], [SFX], [Hook]
     text = re.sub(r"\[[^\]]*\]", " ", text)
-    # Remove parenthetical stage directions that include known keywords
     text = PAREN_STAGE_RE.sub(" ", text)
-    # Also remove standalone lines that are likely cues (all caps short lines)
     text = re.sub(r"^\s*[A-Z ]{3,20}:?\s*$", " ", text, flags=re.MULTILINE)
-    # Collapse spaces
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
-def pillow_fit_center_crop(img_path: str, width: int, height: int) -> np.ndarray:
-    with Image.open(img_path) as im:
-        im = im.convert("RGB")
-        src_w, src_h = im.size
-        target_ratio = width / height
-        src_ratio = src_w / src_h
-        if src_ratio >= target_ratio:
-            new_h = height
-            new_w = int(src_ratio * new_h)
-        else:
-            new_w = width
-            new_h = int(new_w / src_ratio)
-        im = im.resize((new_w, new_h), Image.LANCZOS)
-        left = (new_w - width) // 2
-        top = (new_h - height) // 2
-        im = im.crop((left, top, left + width, top + height))
-        return np.array(im)
-
-
 def tts_chunks_and_srt(script_text: str, temp_dir: Path, lang: str = "en") -> Tuple[AudioArrayClip, Path, List[Tuple[int, float, float, str]]]:
-    # Clean stage directions before chunking/tts
     script_text = clean_script_for_tts(script_text)
     chunks = split_text_into_chunks(script_text, max_chars=180)
     if not chunks:
@@ -352,8 +327,27 @@ def tts_chunks_and_srt(script_text: str, temp_dir: Path, lang: str = "en") -> Tu
 
 
 # -------------------------
-# Title (Pillow fallback)
+# Pillow helpers for video frames
 # -------------------------
+def pillow_fit_center_crop(img_path: str, width: int, height: int) -> np.ndarray:
+    with Image.open(img_path) as im:
+        im = im.convert("RGB")
+        src_w, src_h = im.size
+        target_ratio = width / height
+        src_ratio = src_w / src_h
+        if src_ratio >= target_ratio:
+            new_h = height
+            new_w = int(src_ratio * new_h)
+        else:
+            new_w = width
+            new_h = int(new_w / src_ratio)
+        im = im.resize((new_w, new_h), Image.LANCZOS)
+        left = (new_w - width) // 2
+        top = (new_h - height) // 2
+        im = im.crop((left, top, left + width, top + height))
+        return np.array(im)
+
+
 def _pillow_title_clip(title_text: str, width: int, height: int, duration: float = 3.0,
                        bg_color=(20, 20, 20), font_color=(255, 255, 255)):
     try:
@@ -410,7 +404,7 @@ def build_video_from_script_and_images(
     # Create chunked audio + SRT (cleaned inside)
     final_audio, srt_path, srt_entries = tts_chunks_and_srt(script_text, tmpdir, lang="en")
 
-    # Optionally enforce target duration on audio + SRT using array ops (avoid set_start/subclip)
+    # Optionally enforce target duration on audio + SRT using array ops
     if target_duration_s and strict_enforce:
         fps = 44100
         arr = final_audio.to_soundarray(fps=fps)
@@ -420,7 +414,6 @@ def build_video_from_script_and_images(
         target_samples = int(float(target_duration_s) * fps)
         if cur_samples > target_samples:
             arr = arr[:target_samples]
-            # Trim SRT
             target = float(target_duration_s)
             trimmed: List[Tuple[int, float, float, str]] = []
             for idx, start, end, text in srt_entries:
@@ -474,13 +467,9 @@ def build_video_from_script_and_images(
     per_clip = max(2.0, base_duration / max(1, n))
     clips: List[ImageClip] = []
     for idx, img in enumerate(image_files):
-        frame = pillow_fit_center_crop(str(img), W, H)  # returns 1920x1080 np.ndarray
+        frame = pillow_fit_center_crop(str(img), W, H)
         clip = ImageClip(frame, duration=per_clip)
         clips.append(clip)
-       
-
-
-
 
     slideshow = concatenate_videoclips(clips, method="compose")
     full = concatenate_videoclips([title_clip, slideshow], method="compose")
@@ -492,13 +481,12 @@ def build_video_from_script_and_images(
         try:
             frame = last_src.get_frame(max(0.0, (last_src.duration or 0) - 1e-3))
         except Exception:
-            frame = np.array(Image.open(str(image_files[-1])).convert("RGB"))
+            frame = pillow_fit_center_crop(str(image_files[-1]), W, H)
         last_pad = ImageClip(frame, duration=leftover)
         full = concatenate_videoclips([full, last_pad], method="compose")
 
     final = full.set_audio(final_audio).set_duration(final_audio.duration)
 
-    # High-quality export settings
     final.write_videofile(
         str(out_video_path),
         fps=30,
@@ -507,16 +495,11 @@ def build_video_from_script_and_images(
         preset="slow",
         bitrate=None,
         ffmpeg_params=[
-            "-crf",
-            "18",
-            "-pix_fmt",
-            "yuv420p",
-            "-profile:v",
-            "high",
-            "-level",
-            "4.2",
-            "-movflags",
-            "+faststart",
+            "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-profile:v", "high",
+            "-level", "4.2",
+            "-movflags", "+faststart",
         ],
         threads=os.cpu_count() or 2,
     )
@@ -561,7 +544,7 @@ def generate_thumbnail_pillow(title: str, out_path: Path, subtitle: str = ""):
     y = 140
     for line in lines[:3]:
         tw = draw.textlength(line, font=font_title)
-        th = font_title.size + 6 if hasattr(font_title, "size") else 70
+        th = getattr(font_title, "size", 64) + 6
         draw.text(((W - tw) / 2, y), line, font=font_title, fill=(255, 255, 255))
         y += th
 
@@ -615,24 +598,132 @@ def s3_upload_file(local_path: Path, content_type: str = None) -> Tuple[bool, st
 
 
 # -------------------------
+# Google Trends + SEO metadata
+# -------------------------
+def fetch_google_trends(niche: str, geo: str = "US", timeframe: str = "today 3-m", lang: str = "en-US") -> Dict[str, Any]:
+    pytrends = TrendReq(hl=lang, tz=360)
+    kw = niche.strip() or "trending"
+    pytrends.build_payload([kw], cat=0, timeframe=timeframe, geo=geo, gprop="")
+
+    data: Dict[str, Any] = {"keyword": kw, "geo": geo, "timeframe": timeframe}
+
+    try:
+        rq = pytrends.related_queries()
+        data["related_queries_top"] = (rq.get(kw, {}) or {}).get("top")
+        data["related_queries_rising"] = (rq.get(kw, {}) or {}).get("rising")
+    except Exception as e:
+        data["related_queries_top"] = None
+        data["related_queries_rising"] = None
+        print("related_queries error:", e)
+
+    try:
+        topics = pytrends.related_topics()
+        data["related_topics"] = topics.get(kw)
+    except Exception as e:
+        data["related_topics"] = None
+        print("related_topics error:", e)
+
+    try:
+        iot = pytrends.interest_over_time()
+        if iot is not None and not iot.empty:
+            series = iot[kw].reset_index().rename(columns={kw: "score"})
+            data["interest_over_time"] = series.to_dict(orient="records")
+        else:
+            data["interest_over_time"] = []
+    except Exception as e:
+        data["interest_over_time"] = []
+        print("interest_over_time error:", e)
+
+    try:
+        sug = pytrends.suggestions(keyword=kw)
+        data["suggestions"] = sug
+    except Exception as e:
+        data["suggestions"] = []
+        print("suggestions error:", e)
+
+    return data
+
+
+def analyze_trend_strength(interest_points: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not interest_points:
+        return {"direction": "unknown", "slope": 0.0}
+    y = np.array([float(p.get("score", 0.0)) for p in interest_points], dtype=float)
+    x = np.arange(len(y), dtype=float)
+    if len(y) < 2 or np.all(y == y[0]):
+        return {"direction": "flat", "slope": 0.0}
+    slope = float(np.polyfit(x, y, 1)[0])
+    direction = "rising" if slope > 0 else ("falling" if slope < 0 else "flat")
+    return {"direction": direction, "slope": slope}
+
+
+def generate_metadata_openai(niche: str, trends: Dict[str, Any]) -> Dict[str, Any]:
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    trend_brief = {
+        "keyword": trends.get("keyword"),
+        "geo": trends.get("geo"),
+        "timeframe": trends.get("timeframe"),
+        "related_queries_top": (trends.get("related_queries_top") or [])[:10],
+        "related_queries_rising": (trends.get("related_queries_rising") or [])[:10],
+        "suggestions": (trends.get("suggestions") or [])[:10],
+        "interest_summary": analyze_trend_strength(trends.get("interest_over_time") or []),
+    }
+
+    system = (
+        "You are an SEO optimizer for YouTube. Using the provided trends data, craft: "
+        "1 best video title (<= 70 chars), 3 alternative titles, 10-15 comma-separated SEO tags, "
+        "and a compelling description (<= 200 words). Predict if the topic is rising/flat/falling and explain briefly. "
+        "Return only strict JSON with keys: best_title, alt_titles (list), tags (list), description, predicted_trend, reasoning."
+    )
+    user = json.dumps({"niche": niche, "trends": trend_brief}, ensure_ascii=False)
+
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        temperature=0.4,
+        max_tokens=700,
+    )
+    content = resp.choices[0].message.content.strip()
+    try:
+        data = json.loads(content)
+    except Exception:
+        # Fallback minimal structure
+        data = {
+            "best_title": f"{niche}: What You Need to Know Right Now",
+            "alt_titles": [f"{niche} Trends Explained", f"{niche} in 60 Seconds", f"Top {niche} Tips"],
+            "tags": [niche, f"{niche} tips", f"{niche} trends"],
+            "description": content[:900],
+            "predicted_trend": analyze_trend_strength(trends.get("interest_over_time") or []).get("direction", "unknown"),
+            "reasoning": "Generated without strict JSON parse; please review.",
+        }
+    return data
+
+
+# -------------------------
 # Streamlit UI
 # -------------------------
-st.set_page_config(page_title="YouTube Auto Studio (copyright + SRT + S3)", page_icon="🎬", layout="wide")
-st.title("YouTube Auto Studio — Niche → Topic → Script → Video → Thumbnail")
+st.set_page_config(page_title="YouTube Auto Studio (Trends + SEO + SRT + S3)", page_icon="🎬", layout="wide")
+st.title("YouTube Auto Studio — Trends → Topic → Script → Video → SEO → Thumbnail")
 
 with st.sidebar:
     st.header("Config")
     st.write("Ensure env vars:\n- OPENAI_API_KEY\n- YOUTUBE_API_KEY\n(optional) PEXELS_API_KEY\n(optional) AWS_ACCESS_KEY_ID/SECRET, S3_BUCKET_NAME")
-    st.write("Note: This app builds videos and can upload to S3 for public links (good for Render).")
+    st.write("Note: App builds videos and can upload to S3 for public links.")
     safety_mode = st.checkbox("Safety mode (require LLM SAFE + creativeCommons)", value=True)
     prefer_cc = st.checkbox("Prefer Creative Commons in search", value=False)
     st.session_state["prefer_cc"] = prefer_cc
     debug_mode = st.checkbox("Debug mode (show full errors)", value=False)
     st.session_state["debug_mode"] = debug_mode
-    confirm_royalty_free = st.checkbox("I confirm I will use only royalty-free/original media (e.g., Pexels, own assets)", value=False)
+    confirm_royalty_free = st.checkbox("I confirm I will use only royalty-free/original media", value=False)
     st.session_state["confirm_royalty_free"] = confirm_royalty_free
     reuse_youtube_clips = st.checkbox("I will reuse clips from fetched YouTube videos", value=False)
     st.session_state["reuse_youtube_clips"] = reuse_youtube_clips
+
+    st.markdown("---")
+    st.subheader("Google Trends")
+    geo = st.selectbox("Region", ["US", "GB", "IN", "CA", "AU", "DE", "FR", "BR", "ZA", "JP", "KR", "RU", "MX", "IT", "ES", "NL", "SE", "NO", "PL", "TR", "ID", "PH", "VN", "SG", "AE", "SA"], index=0)
+    timeframe = st.selectbox("Timeframe", ["now 7-d", "today 1-m", "today 3-m", "today 12-m", "today 5-y", "all"], index=2)
+    st.session_state["trends_geo"] = geo
+    st.session_state["trends_timeframe"] = timeframe
 
 col1, col2 = st.columns([3, 1])
 with col1:
@@ -666,7 +757,6 @@ if "suggestions" in st.session_state:
     chosen = st.selectbox("Choose topic to generate script", [t for t, r in st.session_state["suggestions"]])
     st.session_state["chosen_title"] = chosen
 
-    # Length controls
     len_col1, len_col2 = st.columns([1, 1])
     with len_col1:
         length_mode = st.selectbox("Length preset", ["Short (~60s)", "Custom (seconds)"])
@@ -677,6 +767,7 @@ if "suggestions" in st.session_state:
             target_seconds = 60
     st.session_state["target_duration_s"] = target_seconds
 
+    # Safety checks
     if st.button("Run copyright & license safety check for chosen topic"):
         with st.spinner("Running safety checks..."):
             context_text = "\n".join([f"{v['title']} — {v['url']}" for v in st.session_state.get("videos", [])])
@@ -691,11 +782,12 @@ if "suggestions" in st.session_state:
                 licenses[v["video_id"]] = lic
             st.session_state["video_licenses"] = licenses
             st.success("Safety checks complete.")
+
     if "copyright_llm_status" in st.session_state:
         st.markdown("**LLM copyright check:**")
         st.write(st.session_state["copyright_llm_status"])
         st.markdown("**Top videos' YouTube license types (first 6):**")
-        for vid, lic in st.session_state.get("video_licenses", {}).items():
+        for vid, lic in list(st.session_state.get("video_licenses", {}).items())[:6]:
             st.write(f"- {vid}: {lic}")
         llm_status, llm_reason = st.session_state["copyright_llm_status"]
         if llm_status == "RISK":
@@ -715,15 +807,55 @@ if "suggestions" in st.session_state:
             any_cc = True
         if st.session_state.get("confirm_royalty_free"):
             any_cc = True
-        # If not reusing YouTube clips, CC is not required; only require LLM SAFE
         if not reuse:
             return llm_safe
-        # If reusing YouTube clips, require both LLM SAFE and a CC source
         return llm_safe and any_cc
+
+    # SEO Metadata via Google Trends
+    st.subheader("SEO metadata from Google Trends")
+    tr_col1, tr_col2 = st.columns([1, 1])
+    with tr_col1:
+        if st.button("Fetch Google Trends"):
+            try:
+                with st.spinner("Fetching Google Trends..."):
+                    trends = fetch_google_trends(niche=chosen, geo=st.session_state.get("trends_geo", "US"), timeframe=st.session_state.get("trends_timeframe", "today 3-m"))
+                    st.session_state["trends_data"] = trends
+                    iot_summary = analyze_trend_strength(trends.get("interest_over_time") or [])
+                    st.success(f"Trends fetched. Direction: {iot_summary.get('direction')} (slope={iot_summary.get('slope'):.3f})")
+            except Exception as e:
+                st.error(f"Trends fetch failed: {e}")
+    with tr_col2:
+        if st.button("Generate metadata (AI)"):
+            try:
+                if "trends_data" not in st.session_state:
+                    st.warning("Fetch Google Trends first.")
+                else:
+                    with st.spinner("Generating SEO title/tags/description..."):
+                        meta = generate_metadata_openai(niche=chosen, trends=st.session_state["trends_data"])
+                        st.session_state["seo_meta"] = meta
+                        st.success("SEO metadata ready.")
+            except Exception as e:
+                st.error(f"Metadata generation failed: {e}")
+
+    if "seo_meta" in st.session_state:
+        meta = st.session_state["seo_meta"]
+        st.markdown("**Best Title**:")
+        st.write(meta.get("best_title", ""))
+        st.markdown("**Alternative Titles**:")
+        for t in meta.get("alt_titles", [])[:3]:
+            st.write(f"- {t}")
+        st.markdown("**Tags**:")
+        st.write(", ".join(meta.get("tags", [])))
+        st.markdown("**Description**:")
+        st.text_area("Description", meta.get("description", ""), height=180)
+        st.caption(f"Predicted trend: {meta.get('predicted_trend', 'unknown')}. Reason: {meta.get('reasoning', '')}")
+        use_title = st.checkbox("Use 'Best Title' for video title & thumbnail", value=True)
+        if use_title:
+            st.session_state["chosen_title"] = meta.get("best_title") or st.session_state.get("chosen_title")
 
     if st.button("Generate script for chosen topic"):
         with st.spinner("Generating script..."):
-            script = generate_script_openai(chosen, target_seconds=st.session_state.get("target_duration_s"))
+            script = generate_script_openai(st.session_state.get("chosen_title", chosen), target_seconds=st.session_state.get("target_duration_s"))
             st.session_state["script"] = script
             st.success("Script generated.")
             st.text_area("Generated Script", script, height=300)
@@ -740,7 +872,6 @@ if "script" in st.session_state:
                     tmpdir = Path(tempfile.gettempdir())
                     base = safe_file_name(st.session_state.get("script", "script"))
                     temp_audio = Path(tmpdir) / f"{base}_narration.mp3"
-                    # Use cleaned text
                     cleaned = clean_script_for_tts(st.session_state["script"])
                     audio_clip, srt_path, _ = tts_chunks_and_srt(cleaned, Path(tempfile.mkdtemp()))
                     audio_clip.write_audiofile(str(temp_audio))
@@ -754,12 +885,11 @@ if "script" in st.session_state:
         strict_enforce = st.checkbox("Strictly enforce target duration", value=True)
         if st.button("Assemble Video (1080p + audio)"):
             if safety_mode and not passes_safety_gate():
-                # Auto-run safety checks once if missing, then retry gate
                 if "copyright_llm_status" not in st.session_state or "video_licenses" not in st.session_state:
                     try:
                         with st.spinner("Running safety checks..."):
                             context_text = "\n".join([f"{v['title']} — {v['url']}" for v in st.session_state.get("videos", [])])
-                            status, explanation = llm_copyright_check(st.session_state.get("chosen_title") or chosen, context_text)
+                            status, explanation = llm_copyright_check(st.session_state.get("chosen_title") or "", context_text)
                             st.session_state["copyright_llm_status"] = (status, explanation)
                             youtube = googleapiclient.discovery.build(
                                 YOUTUBE_API_SERVICE_NAME, YOUTUBE_API_VERSION, developerKey=YOUTUBE_API_KEY
@@ -807,7 +937,7 @@ if "script" in st.session_state:
         if st.button("Generate Thumbnail (Pillow)"):
             try:
                 tmp_thumb = Path(tempfile.gettempdir()) / f"{safe_file_name(niche)}_thumb.jpg"
-                generate_thumbnail_pillow(safe_file_name(niche)[:80], tmp_thumb, subtitle="Auto-generated")
+                generate_thumbnail_pillow(safe_file_name(st.session_state.get("chosen_title", niche))[:80], tmp_thumb, subtitle="Auto-generated")
                 st.session_state["thumb_path"] = str(tmp_thumb)
                 st.success(f"Thumbnail generated: {tmp_thumb}")
                 st.image(str(tmp_thumb), width=480)
@@ -821,7 +951,6 @@ if "video_path" in st.session_state or "audio_path" in st.session_state or "thum
     srt_path = st.session_state.get("srt_path")
     thumb_path = st.session_state.get("thumb_path")
 
-    # Local download buttons
     if video_path and Path(video_path).exists():
         with open(video_path, "rb") as f:
             st.download_button("Download video (MP4)", data=f.read(), file_name=Path(video_path).name, mime="video/mp4")
@@ -835,27 +964,21 @@ if "video_path" in st.session_state or "audio_path" in st.session_state or "thum
         with open(thumb_path, "rb") as f:
             st.download_button("Download thumbnail (JPG)", data=f.read(), file_name=Path(thumb_path).name, mime="image/jpeg")
 
-    # S3 upload and public links
     if S3_BUCKET_NAME and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
         st.write("S3 uploads:")
-        up_results = []
         if video_path and Path(video_path).exists():
             ok, url = s3_upload_file(Path(video_path), content_type="video/mp4")
-            if ok:
-                st.write(f"- Video: {url}")
+            if ok: st.write(f"- Video: {url}")
         if audio_path and Path(audio_path).exists():
             ok, url = s3_upload_file(Path(audio_path), content_type="audio/mpeg")
-            if ok:
-                st.write(f"- Audio: {url}")
+            if ok: st.write(f"- Audio: {url}")
         if srt_path and Path(srt_path).exists():
             ok, url = s3_upload_file(Path(srt_path), content_type="application/x-subrip")
-            if ok:
-                st.write(f"- Subtitles: {url}")
+            if ok: st.write(f"- Subtitles: {url}")
         if thumb_path and Path(thumb_path).exists():
             ok, url = s3_upload_file(Path(thumb_path), content_type="image/jpeg")
-            if ok:
-                st.write(f"- Thumbnail: {url}")
+            if ok: st.write(f"- Thumbnail: {url}")
 
 st.caption(
-    "Notes: This app can run locally or on Render. Large files are uploaded to S3 if configured. MoviePy encoding is CPU-intensive—use an instance with adequate CPU."
+    "Notes: This app adds SEO metadata generation using Google Trends. MoviePy usage avoids editor/vfx modules for compatibility."
 )
