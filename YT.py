@@ -610,9 +610,7 @@ def build_video_from_script_and_images(
     # Parameters for 720p to reduce memory/CPU
     W, H = 1280, 720
 
-    # Title frame (3s) at 1080p using Pillow
-    title_duration = 3.0
-    title_frame = _pillow_title_frame(title_text, W, H)
+    # No title frame (removed per request)
 
     # Build image frames; base durations on enforced audio duration if present
     n = len(image_files)
@@ -625,21 +623,18 @@ def build_video_from_script_and_images(
     # Choose a low fps to keep frame list small while allowing second-level granularity
     seq_fps = 24  # target fps for durations-based sequence (ImageSequenceClip will handle durations)
 
-    # Build a unified timeline with subtitle boundaries and slide changes
-    title_duration = 3.0
-    title_frame = _pillow_title_frame(title_text, W, H)
+    # Build simple slideshow (no title, subtitles provided separately via SRT)
     slide_frames = [pillow_fit_center_crop(str(img), W, H) for img in image_files]
+    frames = slide_frames
+    durations = [per_clip] * len(slide_frames)
 
-    frames, durations = build_timeline_frames(
-        title_frame=title_frame,
-        slide_frames=slide_frames,
-        title_duration=title_duration,
-        per_clip=per_clip,
-        total_duration=float(final_audio.duration),
-        srt_entries=srt_entries,
-        width=W,
-        height=H,
-    )
+    # Adjust last duration to match audio length exactly
+    total = float(sum(durations))
+    audio_total = float(final_audio.duration)
+    if total < audio_total and durations:
+        durations[-1] += (audio_total - total)
+    elif total > audio_total and durations and durations[-1] > (total - audio_total + 0.1):
+        durations[-1] -= (total - audio_total)
 
     video = ImageSequenceClip(frames, durations=durations)
 
@@ -689,19 +684,15 @@ def generate_thumbnail_pillow(title: str, out_path: Path, subtitle: str = ""):
     except Exception:
         font_sub = ImageFont.load_default()
 
-    # Gradient background for better pop
-    grad_top = (30, 30, 30)
-    grad_bottom = (10, 10, 10)
-    for y in range(H):
-        ratio = y / max(1, H - 1)
-        r = int(grad_top[0] * (1 - ratio) + grad_bottom[0] * ratio)
-        g = int(grad_top[1] * (1 - ratio) + grad_bottom[1] * ratio)
-        b = int(grad_top[2] * (1 - ratio) + grad_bottom[2] * ratio)
-        draw.line([(0, y), (W, y)], fill=(r, g, b))
+    # Keep a clean black background for contrast, add subtle top glow
+    for y in range(80):
+        ratio = y / 80.0
+        val = int(16 + ratio * 32)
+        draw.line([(0, y), (W, y)], fill=(val, val, val))
 
-    # Accent bar
-    accent = Image.new("RGB", (W, 140), color=(255, 64, 64))
-    img.paste(accent, (0, H - 160))
+    # Accent bar (optional subtle)
+    accent = Image.new("RGB", (W, 8), color=(255, 64, 64))
+    img.paste(accent, (0, H - 140))
 
     # Title wrapping with tighter bounds for bigger font
     max_width = W - 160
