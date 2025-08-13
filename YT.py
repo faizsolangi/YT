@@ -420,6 +420,140 @@ def _pillow_title_frame(title_text: str, width: int, height: int,
     return np.array(img)
 
 
+def draw_subtitle_on_frame(base_frame: np.ndarray, text: str, width: int, height: int) -> np.ndarray:
+    if not text:
+        return base_frame
+    img = Image.fromarray(base_frame).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 36)
+    except Exception:
+        font = ImageFont.load_default()
+
+    padding_x, padding_y = 24, 16
+    max_text_width = width - 2 * padding_x
+
+    # Wrap text by measuring width
+    words = text.split()
+    lines = []
+    cur = ""
+    for w in words:
+        test = (cur + " " + w).strip()
+        if draw.textlength(test, font=font) <= max_text_width:
+            cur = test
+        else:
+            if cur:
+                lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+
+    line_spacing = 8
+    line_height = (getattr(font, "size", 36)) + line_spacing
+    total_text_h = len(lines) * line_height - line_spacing
+
+    # Box dimensions and position (bottom area)
+    box_margin_bottom = 40
+    box_w = max(draw.textlength(line, font=font) for line in lines) + 2 * padding_x
+    box_h = total_text_h + 2 * padding_y
+    box_x = (width - box_w) // 2
+    box_y = height - box_h - box_margin_bottom
+
+    # Semi-transparent black box
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    odraw = ImageDraw.Draw(overlay)
+    odraw.rounded_rectangle([box_x, box_y, box_x + box_w, box_y + box_h], radius=12, fill=(0, 0, 0, 170))
+
+    # Draw text with white fill and black stroke
+    ty = box_y + padding_y
+    for line in lines:
+        tw = draw.textlength(line, font=font)
+        tx = int((width - tw) / 2)
+        odraw.text((tx, ty), line, font=font, fill=(255, 255, 255, 255), stroke_width=2, stroke_fill=(0, 0, 0, 255))
+        ty += line_height
+
+    composed = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+    return np.array(composed)
+
+
+def build_timeline_frames(
+    title_frame: np.ndarray,
+    slide_frames: List[np.ndarray],
+    title_duration: float,
+    per_clip: float,
+    total_duration: float,
+    srt_entries: List[Tuple[int, float, float, str]],
+    width: int,
+    height: int,
+) -> Tuple[List[np.ndarray], List[float]]:
+    # Build slide boundary times
+    times = [0.0]
+    t = 0.0
+    t += float(title_duration)
+    times.append(t)
+    for _ in slide_frames:
+        t += float(per_clip)
+        times.append(min(t, total_duration))
+        if t >= total_duration:
+            break
+    # Ensure final boundary equals total_duration
+    if times[-1] < total_duration:
+        times[-1] = total_duration
+
+    # Collect SRT boundaries
+    for _, s, e, _ in srt_entries:
+        if 0.0 < s < total_duration:
+            times.append(s)
+        if 0.0 < e < total_duration:
+            times.append(e)
+
+    # Unique sorted boundaries
+    boundaries = sorted(set(round(x, 3) for x in times))
+    if boundaries[0] != 0.0:
+        boundaries = [0.0] + boundaries
+    if boundaries[-1] != round(total_duration, 3):
+        boundaries.append(round(total_duration, 3))
+
+    # Helper to select slide frame at time t
+    def frame_at(tcur: float) -> np.ndarray:
+        if tcur < title_duration:
+            return title_frame
+        idx = int((tcur - title_duration) // per_clip)
+        if idx < 0:
+            idx = 0
+        if idx >= len(slide_frames):
+            idx = len(slide_frames) - 1
+        return slide_frames[idx]
+
+    # Helper to active subtitle at time t
+    def subtitle_at(tcur: float) -> str:
+        for _, s, e, text in srt_entries:
+            if s <= tcur < e:
+                return text
+        return ""
+
+    frames: List[np.ndarray] = []
+    durations: List[float] = []
+
+    for i in range(len(boundaries) - 1):
+        start = float(boundaries[i])
+        end = float(boundaries[i + 1])
+        if end <= start:
+            continue
+        base = frame_at(start)
+        sub_text = subtitle_at(start)
+        out_frame = draw_subtitle_on_frame(base, sub_text, width, height) if sub_text else base
+        frames.append(out_frame)
+        durations.append(end - start)
+
+    # Normalize to exact total_duration if minor rounding issues
+    dur_sum = sum(durations)
+    if abs(dur_sum - total_duration) > 1e-3:
+        durations[-1] += (total_duration - dur_sum)
+
+    return frames, durations
+
+
 # -------------------------
 # Video assembly (MoviePy)
 # -------------------------
@@ -491,24 +625,21 @@ def build_video_from_script_and_images(
     # Choose a low fps to keep frame list small while allowing second-level granularity
     seq_fps = 24  # target fps for durations-based sequence (ImageSequenceClip will handle durations)
 
-    # Build frames list (one frame per slide) and durations list (seconds)
+    # Build a unified timeline with subtitle boundaries and slide changes
     title_duration = 3.0
     title_frame = _pillow_title_frame(title_text, W, H)
-    frames = [title_frame]
-    durations = [title_duration]
+    slide_frames = [pillow_fit_center_crop(str(img), W, H) for img in image_files]
 
-    for img in image_files:
-        frame = pillow_fit_center_crop(str(img), W, H)
-        frames.append(frame)
-        durations.append(per_clip)
-
-    # Adjust last duration to match audio duration
-    total = float(sum(durations))
-    audio_total = float(final_audio.duration)
-    if total < audio_total:
-        durations[-1] += (audio_total - total)
-    elif total > audio_total and durations[-1] > (total - audio_total + 0.1):
-        durations[-1] -= (total - audio_total)
+    frames, durations = build_timeline_frames(
+        title_frame=title_frame,
+        slide_frames=slide_frames,
+        title_duration=title_duration,
+        per_clip=per_clip,
+        total_duration=float(final_audio.duration),
+        srt_entries=srt_entries,
+        width=W,
+        height=H,
+    )
 
     video = ImageSequenceClip(frames, durations=durations)
 
@@ -541,21 +672,39 @@ def build_video_from_script_and_images(
 # -------------------------
 def generate_thumbnail_pillow(title: str, out_path: Path, subtitle: str = ""):
     W, H = 1280, 720
-    bg_color = (18, 18, 18)
+    bg_color = (16, 16, 16)
     img = Image.new("RGB", (W, H), color=bg_color)
     draw = ImageDraw.Draw(img)
 
+    # Try high-impact fonts and larger sizes
     try:
-        font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", 64)
-        font_sub = ImageFont.truetype("DejaVuSans.ttf", 36)
+        font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", 96)
     except Exception:
-        font_title = ImageFont.load_default()
+        try:
+            font_title = ImageFont.truetype("DejaVuSans.ttf", 96)
+        except Exception:
+            font_title = ImageFont.load_default()
+    try:
+        font_sub = ImageFont.truetype("DejaVuSans.ttf", 44)
+    except Exception:
         font_sub = ImageFont.load_default()
 
-    accent = Image.new("RGB", (W, 160), color=(255, 80, 80))
+    # Gradient background for better pop
+    grad_top = (30, 30, 30)
+    grad_bottom = (10, 10, 10)
+    for y in range(H):
+        ratio = y / max(1, H - 1)
+        r = int(grad_top[0] * (1 - ratio) + grad_bottom[0] * ratio)
+        g = int(grad_top[1] * (1 - ratio) + grad_bottom[1] * ratio)
+        b = int(grad_top[2] * (1 - ratio) + grad_bottom[2] * ratio)
+        draw.line([(0, y), (W, y)], fill=(r, g, b))
+
+    # Accent bar
+    accent = Image.new("RGB", (W, 140), color=(255, 64, 64))
     img.paste(accent, (0, H - 160))
 
-    max_width = W - 120
+    # Title wrapping with tighter bounds for bigger font
+    max_width = W - 160
     words = title.split()
     lines: List[str] = []
     cur = ""
@@ -570,18 +719,25 @@ def generate_thumbnail_pillow(title: str, out_path: Path, subtitle: str = ""):
     if cur:
         lines.append(cur)
 
-    y = 140
+    # Shadowed text for readability
+    y = 110
     for line in lines[:3]:
         tw = draw.textlength(line, font=font_title)
-        th = getattr(font_title, "size", 64) + 6
-        draw.text(((W - tw) / 2, y), line, font=font_title, fill=(255, 255, 255))
-        y += th
+        x = int((W - tw) / 2)
+        # shadow
+        draw.text((x + 3, y + 3), line, font=font_title, fill=(0, 0, 0))
+        draw.text((x, y), line, font=font_title, fill=(255, 255, 255))
+        y += (getattr(font_title, "size", 96) + 8)
 
     if subtitle:
         sw = draw.textlength(subtitle, font=font_sub)
-        draw.text(((W - sw) / 2, H - 120), subtitle, font=font_sub, fill=(255, 255, 255))
+        sx = int((W - sw) / 2)
+        sy = H - 120
+        draw.text((sx + 2, sy + 2), subtitle, font=font_sub, fill=(0, 0, 0))
+        draw.text((sx, sy), subtitle, font=font_sub, fill=(255, 255, 255))
 
-    img.save(out_path)
+    # Save with high quality
+    img.save(out_path, quality=95, subsampling=0, optimize=True)
     return out_path
 
 
