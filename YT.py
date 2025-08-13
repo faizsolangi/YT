@@ -945,6 +945,7 @@ if "script" in st.session_state:
         num_images = st.number_input("Number of images for slideshow", min_value=2, max_value=12, value=6)
         strict_enforce = st.checkbox("Strictly enforce target duration", value=True)
         if st.button("Assemble Video (1080p + audio)"):
+            allowed_to_build = True
             if safety_mode and not passes_safety_gate():
                 if "copyright_llm_status" not in st.session_state or "video_licenses" not in st.session_state:
                     try:
@@ -972,28 +973,29 @@ if "script" in st.session_state:
                             st.error("Safety mode is ON: Policy blocked. Disable Safety mode to proceed.")
                     else:
                         st.error("Safety mode is ON: To reuse YouTube clips, requires LLM SAFE and at least one creativeCommons source. Toggle 'Prefer Creative Commons in search', re-fetch, or uncheck 'reuse YouTube clips'.")
-                    st.stop()
-            try:
-                with st.spinner("Fetching images and building video..."):
-                    images = pexels_search_images(niche, per_page=int(num_images))
-                    tmp_video = Path(tempfile.gettempdir()) / f"{safe_file_name(st.session_state.get('script','video'))}.mp4"
-                    video_path, srt_path = build_video_from_script_and_images(
-                        st.session_state["script"],
-                        images,
-                        tmp_video,
-                        title_text=st.session_state.get("chosen_title", "") or safe_file_name(niche),
-                        target_duration_s=st.session_state.get("target_duration_s"),
-                        strict_enforce=bool(strict_enforce),
-                    )
-                    st.session_state["video_path"] = str(video_path)
-                    st.session_state["srt_path"] = str(srt_path)
-                    st.success(f"Video built: {tmp_video}")
-                    st.video(str(tmp_video))
-            except Exception as e:
-                st.error(f"Video assembly failed: {e}")
-                if st.session_state.get("debug_mode"):
-                    st.exception(e)
-                    st.code(traceback.format_exc())
+                    allowed_to_build = False
+            if allowed_to_build:
+                try:
+                    with st.spinner("Fetching images and building video..."):
+                        images = pexels_search_images(niche, per_page=int(num_images))
+                        tmp_video = Path(tempfile.gettempdir()) / f"{safe_file_name(st.session_state.get('script','video'))}.mp4"
+                        video_path, srt_path = build_video_from_script_and_images(
+                            st.session_state["script"],
+                            images,
+                            tmp_video,
+                            title_text=st.session_state.get("chosen_title", "") or safe_file_name(niche),
+                            target_duration_s=st.session_state.get("target_duration_s"),
+                            strict_enforce=bool(strict_enforce),
+                        )
+                        st.session_state["video_path"] = str(video_path)
+                        st.session_state["srt_path"] = str(srt_path)
+                        st.success(f"Video built: {tmp_video}")
+                        st.video(str(tmp_video))
+                except Exception as e:
+                    st.error(f"Video assembly failed: {e}")
+                    if st.session_state.get("debug_mode"):
+                        st.exception(e)
+                        st.code(traceback.format_exc())
     with colC:
         if st.button("Generate Thumbnail (Pillow)"):
             try:
