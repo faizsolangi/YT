@@ -1138,6 +1138,7 @@ with st.sidebar:
     st.session_state["trends_timeframe"] = timeframe
     st.session_state["min_trend_score"] = min_trend_score
     st.session_state["virality_days"] = virality_days
+    use_ai_imgs = st.checkbox("Use AI-generated images for video", value=False, key="use_ai_imgs")
 
 col1, col2 = st.columns([3, 1])
 with col1:
@@ -1300,7 +1301,7 @@ if "script" in st.session_state:
         strict_enforce = st.checkbox("Strictly enforce target duration", value=True)
         if st.button("Assemble Video (1080p + audio)"):
             allowed_to_build = True
-            use_ai_images = st.checkbox("Use AI-generated cartoon images", value=False, key="use_ai_imgs")
+            use_ai_images = bool(st.session_state.get("use_ai_imgs", False))
             if safety_mode and not passes_safety_gate():
                 if "copyright_llm_status" not in st.session_state or "video_licenses" not in st.session_state:
                     try:
