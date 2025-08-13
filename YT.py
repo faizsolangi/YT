@@ -910,6 +910,85 @@ def generate_metadata_openai(niche: str, trends: Dict[str, Any]) -> Dict[str, An
     return data
 
 
+def compute_trend_score(interest_points: List[Dict[str, Any]], method: str = "max", window: int = 7) -> float:
+    if not interest_points:
+        return 0.0
+    scores = [float(p.get("score", 0.0)) for p in interest_points]
+    if not scores:
+        return 0.0
+    if method == "recent_avg" and window and window > 1 and len(scores) >= window:
+        return float(np.mean(scores[-window:]))
+    return float(np.max(scores))
+
+
+def pytrends_suggestions_list(keyword: str, lang: str = "en-US") -> List[str]:
+    try:
+        tr = TrendReq(hl=lang, tz=360)
+        sug = tr.suggestions(keyword=keyword) or []
+        titles = []
+        for item in sug:
+            title = item.get("title") or item.get("keyword") or ""
+            if title and title.lower() != keyword.lower():
+                titles.append(title)
+        return titles
+    except Exception:
+        return []
+
+
+def generate_keyword_variants(niche: str) -> List[str]:
+    niche = (niche or "").strip()
+    year = str((__import__("datetime").datetime.utcnow().year))
+    seeds = [niche]
+    modifiers = ["trends", "news", "guide", "ideas", "tips", "best", "tools", year]
+    for m in modifiers:
+        if m and niche:
+            seeds.append(f"{niche} {m}")
+    return list(dict.fromkeys([s.strip() for s in seeds if s.strip()]))
+
+
+def find_trending_keyword(
+    niche: str,
+    min_score: float = 50.0,
+    geo: str = "US",
+    timeframe: str = "today 3-m",
+    lang: str = "en-US",
+    max_attempts: int = 20,
+) -> Tuple[Optional[str], Optional[Dict[str, Any]], float]:
+    candidates: List[str] = []
+    # Suggestions from pytrends
+    suggestions = pytrends_suggestions_list(niche, lang=lang)
+    candidates.extend(suggestions)
+    # Variants
+    candidates.extend(generate_keyword_variants(niche))
+    # Unique preserve order
+    seen = set()
+    uniq: List[str] = []
+    for c in candidates:
+        key = c.lower()
+        if key not in seen:
+            seen.add(key)
+            uniq.append(c)
+    if not uniq:
+        uniq = [niche]
+
+    attempts = 0
+    best_kw = None
+    best_data = None
+    best_score = -1.0
+
+    for kw in uniq:
+        if attempts >= max_attempts:
+            break
+        attempts += 1
+        data = fetch_google_trends(kw, geo=geo, timeframe=timeframe, lang=lang)
+        score = compute_trend_score(data.get("interest_over_time") or [], method="max")
+        if score > best_score:
+            best_kw, best_data, best_score = kw, data, score
+        if score >= float(min_score):
+            return kw, data, score
+    return best_kw, best_data, float(best_score)
+
+
 # -------------------------
 # Streamlit UI
 # -------------------------
@@ -934,8 +1013,10 @@ with st.sidebar:
     st.subheader("Google Trends")
     geo = st.selectbox("Region", ["US", "GB", "IN", "CA", "AU", "DE", "FR", "BR", "ZA", "JP", "KR", "RU", "MX", "IT", "ES", "NL", "SE", "NO", "PL", "TR", "ID", "PH", "VN", "SG", "AE", "SA"], index=0)
     timeframe = st.selectbox("Timeframe", ["now 7-d", "today 1-m", "today 3-m", "today 12-m", "today 5-y", "all"], index=2)
+    min_trend_score = st.slider("Minimum trend score to accept", min_value=0, max_value=100, value=50, step=5)
     st.session_state["trends_geo"] = geo
     st.session_state["trends_timeframe"] = timeframe
+    st.session_state["min_trend_score"] = min_trend_score
 
 col1, col2 = st.columns([3, 1])
 with col1:
@@ -1029,11 +1110,24 @@ if "suggestions" in st.session_state:
     with tr_col1:
         if st.button("Fetch Google Trends"):
             try:
-                with st.spinner("Fetching Google Trends..."):
-                    trends = fetch_google_trends(niche=chosen, geo=st.session_state.get("trends_geo", "US"), timeframe=st.session_state.get("trends_timeframe", "today 3-m"))
+                with st.spinner("Searching trend-worthy keyword..."):
+                    kw, trends, score = find_trending_keyword(
+                        niche=chosen,
+                        min_score=float(st.session_state.get("min_trend_score", 50)),
+                        geo=st.session_state.get("trends_geo", "US"),
+                        timeframe=st.session_state.get("trends_timeframe", "today 3-m"),
+                        lang="en-US",
+                        max_attempts=25,
+                    )
+                    if trends is None:
+                        st.warning("Could not find a trend-worthy keyword. Showing base niche trends.")
+                        trends = fetch_google_trends(niche=chosen, geo=st.session_state.get("trends_geo", "US"), timeframe=st.session_state.get("trends_timeframe", "today 3-m"))
+                        kw = chosen
+                        score = compute_trend_score(trends.get("interest_over_time") or [])
                     st.session_state["trends_data"] = trends
+                    st.session_state["trending_keyword"] = kw
                     iot_summary = analyze_trend_strength(trends.get("interest_over_time") or [])
-                    st.success(f"Trends fetched. Direction: {iot_summary.get('direction')} (slope={iot_summary.get('slope'):.3f})")
+                    st.success(f"Chosen keyword: '{kw}' (max score={score:.0f}). Direction: {iot_summary.get('direction')} (slope={iot_summary.get('slope'):.3f})")
             except Exception as e:
                 st.error(f"Trends fetch failed: {e}")
     with tr_col2:
