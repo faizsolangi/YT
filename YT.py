@@ -572,6 +572,7 @@ def build_video_from_script_and_images(
     title_text: str,
     target_duration_s: Optional[float] = None,
     strict_enforce: bool = True,
+    motion_enabled: bool = False,
 ) -> Tuple[Path, Path]:
     tmpdir = Path(tempfile.mkdtemp())
 
@@ -631,10 +632,18 @@ def build_video_from_script_and_images(
     # Choose a low fps to keep frame list small while allowing second-level granularity
     seq_fps = 24  # target fps for durations-based sequence (ImageSequenceClip will handle durations)
 
-    # Build simple slideshow (no title, subtitles provided separately via SRT)
+    # Build slideshow with optional motion
     slide_frames = [pillow_fit_center_crop(str(img), W, H) for img in image_files]
-    frames = slide_frames
-    durations = [per_clip] * len(slide_frames)
+    frames: List[np.ndarray] = []
+    durations: List[float] = []
+    if motion_enabled:
+        for sf in slide_frames:
+            mf, md = ken_burns_frames(sf, W, H, duration=float(per_clip), fps=12)
+            frames.extend(mf)
+            durations.extend(md)
+    else:
+        frames = slide_frames
+        durations = [per_clip] * len(slide_frames)
 
     # Adjust last duration to match audio length exactly
     total = float(sum(durations))
@@ -1248,6 +1257,7 @@ if "script" in st.session_state:
                             title_text=st.session_state.get("chosen_title", "") or safe_file_name(niche),
                             target_duration_s=st.session_state.get("target_duration_s"),
                             strict_enforce=bool(strict_enforce),
+                            motion_enabled=bool(st.session_state.get("use_ai_imgs", False)) is False and True,
                         )
                         st.session_state["video_path"] = str(video_path)
                         st.session_state["srt_path"] = str(srt_path)
@@ -1362,3 +1372,37 @@ def generate_cartoon_images_from_script(script_text: str, temp_dir: Path, max_im
         except Exception as e:
             print("AI image generation failed:", e)
     return paths
+
+
+def ken_burns_frames(img: np.ndarray, width: int, height: int, duration: float, fps: int = 12,
+                     zoom_start: float = 1.0, zoom_end: float = 1.06, pan_start: Tuple[float, float] = (0.5, 0.5), pan_end: Tuple[float, float] = (0.52, 0.48)) -> Tuple[List[np.ndarray], List[float]]:
+    num_frames = max(1, int(round(duration * fps)))
+    frames: List[np.ndarray] = []
+    per_frame = duration / num_frames if num_frames > 0 else duration
+
+    pil = Image.fromarray(img).convert("RGB")
+    src_w, src_h = pil.size
+
+    for i in range(num_frames):
+        t = i / max(1, num_frames - 1)
+        scale = zoom_start + (zoom_end - zoom_start) * t
+        cx = pan_start[0] + (pan_end[0] - pan_start[0]) * t
+        cy = pan_start[1] + (pan_end[1] - pan_start[1]) * t
+
+        crop_w = int(round(width / scale))
+        crop_h = int(round(height / scale))
+        crop_w = min(crop_w, src_w)
+        crop_h = min(crop_h, src_h)
+
+        left = int(round(cx * src_w - crop_w / 2))
+        top = int(round(cy * src_h - crop_h / 2))
+        left = max(0, min(left, src_w - crop_w))
+        top = max(0, min(top, src_h - crop_h))
+        right = left + crop_w
+        bottom = top + crop_h
+
+        patch = pil.crop((left, top, right, bottom)).resize((width, height), Image.LANCZOS)
+        frames.append(np.array(patch))
+
+    durations = [per_frame] * len(frames)
+    return frames, durations
