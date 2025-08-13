@@ -92,7 +92,13 @@ def safe_file_name(s: str) -> str:
     return "".join(c if c.isalnum() or c in " ._-" else "_" for c in s)[:120]
 
 
-def fetch_trending_videos_from_youtube(query: str, max_results: int = 10, prefer_creative_commons: bool = False) -> List[dict]:
+def iso_timestamp_days_ago(days: int) -> str:
+    from datetime import datetime, timedelta, timezone
+    dt = datetime.now(timezone.utc) - timedelta(days=max(0, days))
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def fetch_trending_videos_from_youtube(query: str, max_results: int = 10, prefer_creative_commons: bool = False, published_after: Optional[str] = None) -> List[dict]:
     youtube = googleapiclient.discovery.build(
         YOUTUBE_API_SERVICE_NAME, YOUTUBE_API_VERSION, developerKey=YOUTUBE_API_KEY
     )
@@ -102,7 +108,7 @@ def fetch_trending_videos_from_youtube(query: str, max_results: int = 10, prefer
         "type": "video",
         "order": "viewCount",
         "maxResults": max_results,
-        "publishedAfter": YOUTUBE_SEARCH_PUBLISHED_AFTER,
+        "publishedAfter": published_after or YOUTUBE_SEARCH_PUBLISHED_AFTER,
     }
     if prefer_creative_commons:
         kwargs["videoLicense"] = "creativeCommon"
@@ -141,6 +147,42 @@ def call_openai_rank_topics(videos: List[dict]) -> str:
         model=model,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=0.35,
+        max_tokens=500,
+    )
+    return resp.choices[0].message.content.strip()
+
+
+def call_openai_rank_topics_combined(niche: str, videos: List[dict], trends: Dict[str, Any], days: int = 7) -> str:
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    yt_text = "\n".join([f"- {v['title']} — {v['url']} — {v['channel']}" for v in videos[:12]])
+    top_queries = trends.get("related_queries_top") or []
+    rising_queries = trends.get("related_queries_rising") or []
+    suggestions = trends.get("suggestions") or []
+
+    def topn_list(df_like, n=10):
+        try:
+            # pytrends returns pandas DataFrame-like objects
+            rows = df_like.head(n).to_dict(orient="records")
+            return [str(r.get("query") or r) for r in rows]
+        except Exception:
+            return []
+
+    q_top = topn_list(top_queries, 8) if hasattr(top_queries, "head") else []
+    q_rising = topn_list(rising_queries, 8) if hasattr(rising_queries, "head") else []
+    sug_titles = [s.get("title") for s in suggestions if isinstance(s, dict)]
+
+    trends_snippet = "\n".join([f"- {q}" for q in (q_top + q_rising + (sug_titles or []))[:12]])
+
+    system = (
+        "You are a concise YouTube trend strategist. Combine viral YouTube content from the past week with Google Trends cues to craft topics likely to perform in the next 2 weeks."
+    )
+    user = (
+        f"Niche: {niche}\n\nYouTube (last {days} days, top by views):\n{yt_text or '- none'}\n\nGoogle Trends related queries/suggestions:\n{trends_snippet or '- none'}\n\nReturn exactly three suggested topic headlines with one short reason each.\nFormat:\n1) Title: <title>\n   Reason: <one short reason>\n2) Title: ...\n3) Title: ..."
+    )
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        temperature=0.4,
         max_tokens=500,
     )
     return resp.choices[0].message.content.strip()
@@ -1083,9 +1125,11 @@ with st.sidebar:
     geo = st.selectbox("Region", ["US", "GB", "IN", "CA", "AU", "DE", "FR", "BR", "ZA", "JP", "KR", "RU", "MX", "IT", "ES", "NL", "SE", "NO", "PL", "TR", "ID", "PH", "VN", "SG", "AE", "SA"], index=0)
     timeframe = st.selectbox("Timeframe", ["now 7-d", "today 1-m", "today 3-m", "today 12-m", "today 5-y", "all"], index=2)
     min_trend_score = st.slider("Minimum trend score to accept", min_value=0, max_value=100, value=50, step=5)
+    virality_days = st.slider("Virality window (days)", min_value=1, max_value=30, value=7, step=1)
     st.session_state["trends_geo"] = geo
     st.session_state["trends_timeframe"] = timeframe
     st.session_state["min_trend_score"] = min_trend_score
+    st.session_state["virality_days"] = virality_days
 
 col1, col2 = st.columns([3, 1])
 with col1:
@@ -1096,7 +1140,13 @@ with col2:
 if st.button("Fetch trending & suggest topics"):
     try:
         with st.spinner("Searching YouTube..."):
-            vids = fetch_trending_videos_from_youtube(niche, max_results=int(max_results), prefer_creative_commons=bool(st.session_state.get("prefer_cc", False)))
+            past_days = int(st.session_state.get("virality_days", 7))
+            vids = fetch_trending_videos_from_youtube(
+                niche,
+                max_results=int(max_results),
+                prefer_creative_commons=bool(st.session_state.get("prefer_cc", False)),
+                published_after=iso_timestamp_days_ago(past_days),
+            )
             st.session_state["videos"] = vids
         if not vids:
             st.warning("No videos found.")
@@ -1104,8 +1154,18 @@ if st.button("Fetch trending & suggest topics"):
             st.success(f"Fetched {len(vids)} videos.")
             for v in vids[:8]:
                 st.markdown(f"- [{v['title']}]({v['url']}) — {v['channel']} — {v['publishedAt']}")
-            with st.spinner("Asking OpenAI to pick top 3 topics..."):
-                ranked_text = call_openai_rank_topics(vids)
+            with st.spinner("Asking OpenAI to pick top 3 topics (YouTube + Google Trends)..."):
+                trends = st.session_state.get("trends_data") or fetch_google_trends(
+                    niche,
+                    geo=st.session_state.get("trends_geo", "US"),
+                    timeframe=st.session_state.get("trends_timeframe", "today 3-m"),
+                )
+                ranked_text = call_openai_rank_topics_combined(
+                    niche,
+                    vids,
+                    trends,
+                    days=int(st.session_state.get("virality_days", 7)),
+                )
                 st.session_state["ranked_text"] = ranked_text
                 st.session_state["suggestions"] = parse_ranked_text(ranked_text)
                 st.success("Top 3 suggestions generated.")
