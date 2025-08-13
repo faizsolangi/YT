@@ -311,11 +311,19 @@ PAREN_STAGE_RE = re.compile(r"\((?:[^)]*(?:" + STAGE_KEYWORDS + r")[^)]*)\)", fl
 def clean_script_for_tts(text: str) -> str:
     if not text:
         return ""
+    # Remove markdown/formatting
     text = re.sub(r"[*_#`]+", " ", text)
     text = re.sub(r"^\s*[-•]+\s+", "", text, flags=re.MULTILINE)
+    # Remove bracketed or parenthetical stage directions
     text = re.sub(r"\[[^\]]*\]", " ", text)
     text = PAREN_STAGE_RE.sub(" ", text)
+    # Remove speaker labels like "Host:", "Narrator:", "VO:", etc. at line starts
+    text = re.sub(r"^\s*[A-Za-z][A-Za-z ]{0,20}:\s+", " ", text, flags=re.MULTILINE)
+    # Remove common sound cue phrases inline
+    text = re.sub(r"\b(jingle\s*bell\s*sound|applause|whoosh|sting|ding|sfx|bgm|music\s*(starts|plays)?|sound\s*effect[s]?)\b[:,-]*\s*", " ", text, flags=re.IGNORECASE)
+    # Remove standalone short all-caps cue lines
     text = re.sub(r"^\s*[A-Z ]{3,20}:?\s*$", " ", text, flags=re.MULTILINE)
+    # Collapse whitespace
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -1191,6 +1199,7 @@ if "script" in st.session_state:
         strict_enforce = st.checkbox("Strictly enforce target duration", value=True)
         if st.button("Assemble Video (1080p + audio)"):
             allowed_to_build = True
+            use_ai_images = st.checkbox("Use AI-generated cartoon images", value=False, key="use_ai_imgs")
             if safety_mode and not passes_safety_gate():
                 if "copyright_llm_status" not in st.session_state or "video_licenses" not in st.session_state:
                     try:
@@ -1221,9 +1230,17 @@ if "script" in st.session_state:
                     allowed_to_build = False
             if allowed_to_build:
                 try:
-                    with st.spinner("Fetching images and building video..."):
-                        images = pexels_search_images(niche, per_page=int(num_images))
+                    with st.spinner("Preparing images and building video..."):
                         tmp_video = Path(tempfile.gettempdir()) / f"{safe_file_name(st.session_state.get('script','video'))}.mp4"
+                        if use_ai_images:
+                            tmpdir = Path(tempfile.mkdtemp())
+                            ai_images = generate_cartoon_images_from_script(st.session_state["script"], tmpdir, max_images=int(num_images))
+                            images = [str(p) for p in ai_images]
+                            if not images:
+                                st.warning("AI image generation failed; falling back to Pexels.")
+                                images = pexels_search_images(niche, per_page=int(num_images))
+                        else:
+                            images = pexels_search_images(niche, per_page=int(num_images))
                         video_path, srt_path = build_video_from_script_and_images(
                             st.session_state["script"],
                             images,
@@ -1290,3 +1307,58 @@ if "video_path" in st.session_state or "audio_path" in st.session_state or "thum
 st.caption(
     "Notes: This app adds SEO metadata generation using Google Trends. MoviePy usage avoids editor/vfx modules for compatibility."
 )
+
+def chunk_script_for_images(text: str, max_chunks: int = 8) -> List[str]:
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    sentences = [s.strip() for s in sentences if s.strip()]
+    if not sentences:
+        return []
+    chunks: List[str] = []
+    cur = ""
+    for s in sentences:
+        if len(cur) + len(s) + 1 <= 180:
+            cur = (cur + " " + s).strip()
+        else:
+            if cur:
+                chunks.append(cur)
+            cur = s
+        if len(chunks) >= max_chunks:
+            break
+    if cur and len(chunks) < max_chunks:
+        chunks.append(cur)
+    return chunks
+
+
+def prompts_from_script_chunks(chunks: List[str], style: str = "cartoon, vibrant, friendly, flat shading") -> List[str]:
+    prompts: List[str] = []
+    for i, ch in enumerate(chunks, 1):
+        prompts.append(
+            f"Illustration, {style}. Scene {i}: {ch}. Clear composition, single focal subject, no text, 16:9."
+        )
+    return prompts
+
+
+def openai_generate_image(prompt: str, out_path: Path, size: str = "1280x720") -> Path:
+    model = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
+    resp = client.images.generate(model=model, prompt=prompt, size=size)
+    b64 = resp.data[0].b64_json
+    import base64
+    data = base64.b64decode(b64)
+    with open(out_path, "wb") as f:
+        f.write(data)
+    return out_path
+
+
+def generate_cartoon_images_from_script(script_text: str, temp_dir: Path, max_images: int = 8) -> List[Path]:
+    cleaned = clean_script_for_tts(script_text)
+    chunks = chunk_script_for_images(cleaned, max_chunks=max_images)
+    prompts = prompts_from_script_chunks(chunks)
+    paths: List[Path] = []
+    for i, p in enumerate(prompts, 1):
+        path = temp_dir / f"ai_img_{i:02d}.png"
+        try:
+            openai_generate_image(p, path, size="1280x720")
+            paths.append(path)
+        except Exception as e:
+            print("AI image generation failed:", e)
+    return paths
