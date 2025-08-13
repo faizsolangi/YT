@@ -473,8 +473,8 @@ def build_video_from_script_and_images(
     if not image_files:
         raise RuntimeError("No images to build video.")
 
-    # Parameters for 1080p
-    W, H = 1920, 1080
+    # Parameters for 720p to reduce memory/CPU
+    W, H = 1280, 720
 
     # Title frame (3s) at 1080p using Pillow
     title_duration = 3.0
@@ -489,27 +489,28 @@ def build_video_from_script_and_images(
     durations: List[float] = []  # kept for reference only
 
     # Choose a low fps to keep frame list small while allowing second-level granularity
-    seq_fps = 5  # frames per second
+    seq_fps = 24  # target fps for durations-based sequence (ImageSequenceClip will handle durations)
 
-    # Title first
+    # Build frames list (one frame per slide) and durations list (seconds)
     title_duration = 3.0
     title_frame = _pillow_title_frame(title_text, W, H)
-    frames.extend([title_frame] * max(1, int(round(title_duration * seq_fps))))
+    frames = [title_frame]
+    durations = [title_duration]
 
-    # Slides
-    for idx, img in enumerate(image_files):
+    for img in image_files:
         frame = pillow_fit_center_crop(str(img), W, H)
-        repeat = max(1, int(round(per_clip * seq_fps)))
-        frames.extend([frame] * repeat)
+        frames.append(frame)
+        durations.append(per_clip)
 
-    # Adjust total frames to match audio duration exactly (within 1/seq_fps)
-    target_frames = int(round(float(final_audio.duration) * seq_fps))
-    if len(frames) < target_frames:
-        frames.extend([frames[-1]] * (target_frames - len(frames)))
-    elif len(frames) > target_frames:
-        frames = frames[:target_frames]
+    # Adjust last duration to match audio duration
+    total = float(sum(durations))
+    audio_total = float(final_audio.duration)
+    if total < audio_total:
+        durations[-1] += (audio_total - total)
+    elif total > audio_total and durations[-1] > (total - audio_total + 0.1):
+        durations[-1] -= (total - audio_total)
 
-    video = ImageSequenceClip(frames, fps=seq_fps)
+    video = ImageSequenceClip(frames, durations=durations)
 
     try:
         final = video.set_audio(final_audio)
@@ -519,19 +520,17 @@ def build_video_from_script_and_images(
 
     final.write_videofile(
         str(out_video_path),
-        fps=30,
+        fps=24,
         codec="libx264",
         audio_codec="aac",
-        preset="slow",
+        preset="veryfast",
         bitrate=None,
         ffmpeg_params=[
-            "-crf", "18",
+            "-crf", "23",
             "-pix_fmt", "yuv420p",
-            "-profile:v", "high",
-            "-level", "4.2",
             "-movflags", "+faststart",
         ],
-        threads=os.cpu_count() or 2,
+        threads=1,
     )
 
     return out_video_path, srt_path
