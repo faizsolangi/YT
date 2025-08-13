@@ -639,7 +639,10 @@ def build_video_from_script_and_images(
     durations: List[float] = []
     if motion_enabled:
         for sf in slide_frames:
-            mf, md = ken_burns_frames(sf, W, H, duration=float(per_clip), fps=12)
+            try:
+                mf, md = ken_burns_frames(sf, W, H, duration=float(per_clip), fps=12)
+            except NameError:
+                mf, md = [sf], [float(per_clip)]
             frames.extend(mf)
             durations.extend(md)
     else:
@@ -794,14 +797,13 @@ def s3_upload_file(local_path: Path, content_type: str = None) -> Tuple[bool, st
 # -------------------------
 # Google Trends + SEO metadata
 # -------------------------
-def fetch_google_trends(niche: str, geo: str = "US", timeframe: str = "today 3-m", lang: str = "en-US") -> Dict[str, Any]:
+def fetch_google_trends(niche: str, geo: str = "US", timeframe: str = "today 3-m", lang: str = "en-US", prefer_youtube: bool = False, aggressive: bool = True) -> Dict[str, Any]:
     proxies_env = os.getenv("PYTRENDS_PROXIES", "").strip()
     proxies = None
     if proxies_env:
         try:
             proxies = json.loads(proxies_env)
         except Exception:
-            # allow a simple http proxy string
             proxies = {"https": proxies_env, "http": proxies_env}
 
     def make_pytrends():
@@ -809,46 +811,95 @@ def fetch_google_trends(niche: str, geo: str = "US", timeframe: str = "today 3-m
 
     kw = niche.strip() or "trending"
 
-    # Backoff loop for build_payload which is the most common 429 source
+    # Build fallback lists
+    timeframe_list = [timeframe]
+    if aggressive:
+        for tf in ["today 12-m", "today 5-y", "all"]:
+            if tf not in timeframe_list:
+                timeframe_list.append(tf)
+    gprops = ["youtube", ""] if prefer_youtube else ["", "youtube"]
+
     backoff = 1.0
-    last_err = None
-    for attempt in range(5):
+
+    def try_call(fn, *args, **kwargs):
+        nonlocal backoff
         try:
-            pytrends = make_pytrends()
-            pytrends.build_payload([kw], cat=0, timeframe=timeframe, geo=geo, gprop="")
+            res = fn(*args, **kwargs)
+            time.sleep(0.6)
+            return res
+        except Exception:
+            time.sleep(backoff + np.random.rand() * 0.4)
+            backoff = min(backoff * 1.7 + 0.2, 20.0)
+            return None
+
+    def nonzero_series(iot_df) -> bool:
+        try:
+            if iot_df is None or getattr(iot_df, "empty", True):
+                return False
+            if kw not in iot_df.columns:
+                return False
+            col = iot_df[kw]
+            return bool(np.any((np.array(col.values, dtype=float) > 0)))
+        except Exception:
+            return False
+
+    last_err = None
+    chosen = None
+    pytrends = None
+
+    for tf in timeframe_list:
+        for gp in gprops:
+            for attempt in range(4):
+                try:
+                    pytrends = make_pytrends()
+                    pytrends.build_payload([kw], cat=0, timeframe=tf, geo=geo, gprop=gp)
+                    iot = try_call(pytrends.interest_over_time)
+                    if nonzero_series(iot):
+                        chosen = (tf, gp)
+                        break
+                    # Try best region if zero
+                    ibr = try_call(pytrends.interest_by_region, resolution='COUNTRY', inc_low_vol=True)
+                    if ibr is not None and not getattr(ibr, 'empty', True):
+                        ibr_sorted = ibr.sort_values(by=kw, ascending=False)
+                        if not ibr_sorted.empty and float(ibr_sorted.iloc[0][kw]) > 0:
+                            top_region = getattr(ibr_sorted.iloc[0], ibr_sorted.index.name or 'geoName') if hasattr(ibr_sorted, 'index') else None
+                            if top_region and isinstance(top_region, str) and len(top_region) <= 2:
+                                # likely ISO-2 code
+                                pytrends = make_pytrends()
+                                pytrends.build_payload([kw], cat=0, timeframe=tf, geo=top_region, gprop=gp)
+                                iot2 = try_call(pytrends.interest_over_time)
+                                if nonzero_series(iot2):
+                                    geo = top_region
+                                    iot = iot2
+                                    chosen = (tf, gp)
+                                    break
+                    last_err = None
+                except Exception as e:
+                    last_err = e
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2.0, 16.0)
+            if chosen:
+                break
+        if chosen:
             break
-        except Exception as e:
-            last_err = e
-            time.sleep(backoff)
-            backoff = min(backoff * 2.0, 16.0)
-    else:
-        # could not build payload; return minimal structure with error note
+
+    if not chosen:
+        # Fallback minimal structure when zero throughout
         return {
             "keyword": kw,
             "geo": geo,
             "timeframe": timeframe,
+            "gprop": gprops[0] if gprops else "",
             "related_queries_top": [],
             "related_queries_rising": [],
             "related_topics": [],
             "interest_over_time": [],
             "suggestions": [],
-            "error": f"build_payload_failed: {last_err}",
+            "error": f"no_nonzero_series (last_err={last_err})",
         }
 
-    data: Dict[str, Any] = {"keyword": kw, "geo": geo, "timeframe": timeframe}
-
-    # Add small delay between calls to avoid 429 bursts
-    def try_call(fn, *args, **kwargs):
-        nonlocal backoff
-        try:
-            res = fn(*args, **kwargs)
-            time.sleep(0.7)
-            return res
-        except Exception as e:
-            # apply jittered backoff then return None
-            time.sleep(backoff + np.random.rand() * 0.5)
-            backoff = min(backoff * 1.6 + 0.3, 20.0)
-            return None
+    # With chosen settings, collect details
+    data: Dict[str, Any] = {"keyword": kw, "geo": geo, "timeframe": chosen[0], "gprop": chosen[1]}
 
     rq = try_call(pytrends.related_queries)
     if isinstance(rq, dict):
@@ -1135,7 +1186,7 @@ if "suggestions" in st.session_state:
                         geo=st.session_state.get("trends_geo", "US"),
                         timeframe=st.session_state.get("trends_timeframe", "today 3-m"),
                         lang="en-US",
-                        max_attempts=25,
+                        max_attempts=30,
                     )
                     if trends is None:
                         st.warning("Could not find a trend-worthy keyword. Showing base niche trends.")
