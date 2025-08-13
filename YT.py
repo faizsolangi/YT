@@ -485,30 +485,35 @@ def build_video_from_script_and_images(
     base_duration = final_audio.duration
     per_clip = max(2.0, base_duration / max(1, n))
 
-    frames: List[np.ndarray] = [title_frame]
-    durations: List[float] = [title_duration]
+    frames: List[np.ndarray] = []
+    durations: List[float] = []  # kept for reference only
 
+    # Choose a low fps to keep frame list small while allowing second-level granularity
+    seq_fps = 5  # frames per second
+
+    # Title first
+    title_duration = 3.0
+    title_frame = _pillow_title_frame(title_text, W, H)
+    frames.extend([title_frame] * max(1, int(round(title_duration * seq_fps))))
+
+    # Slides
     for idx, img in enumerate(image_files):
         frame = pillow_fit_center_crop(str(img), W, H)
-        frames.append(frame)
-        durations.append(per_clip)
+        repeat = max(1, int(round(per_clip * seq_fps)))
+        frames.extend([frame] * repeat)
 
-    # Adjust last duration to match audio length exactly
-    total_dur = float(sum(durations))
-    audio_dur = float(final_audio.duration)
-    if abs(total_dur - audio_dur) > 1e-3:
-        if total_dur < audio_dur:
-            durations[-1] += (audio_dur - total_dur)
-        else:
-            excess = total_dur - audio_dur
-            durations[-1] = max(0.1, durations[-1] - excess)
+    # Adjust total frames to match audio duration exactly (within 1/seq_fps)
+    target_frames = int(round(float(final_audio.duration) * seq_fps))
+    if len(frames) < target_frames:
+        frames.extend([frames[-1]] * (target_frames - len(frames)))
+    elif len(frames) > target_frames:
+        frames = frames[:target_frames]
 
-    video = ImageSequenceClip(frames, durations=durations)
+    video = ImageSequenceClip(frames, fps=seq_fps)
 
     try:
         final = video.set_audio(final_audio)
     except Exception:
-        # Fallback for environments missing set_audio on clips
         video.audio = final_audio
         final = video
 
