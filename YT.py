@@ -12,6 +12,7 @@ from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 import traceback
+import gc
 import googleapiclient.discovery
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
@@ -1243,7 +1244,7 @@ if "script" in st.session_state:
                         tmp_video = Path(tempfile.gettempdir()) / f"{safe_file_name(st.session_state.get('script','video'))}.mp4"
                         if use_ai_images:
                             tmpdir = Path(tempfile.mkdtemp())
-                            ai_images = generate_cartoon_images_from_script(st.session_state["script"], tmpdir, max_images=int(num_images))
+                            ai_images = generate_cartoon_images_from_script(st.session_state["script"], tmpdir, max_images=min(int(num_images), 6))
                             images = [str(p) for p in ai_images]
                             if not images:
                                 st.warning("AI image generation failed; falling back to Pexels.")
@@ -1257,7 +1258,7 @@ if "script" in st.session_state:
                             title_text=st.session_state.get("chosen_title", "") or safe_file_name(niche),
                             target_duration_s=st.session_state.get("target_duration_s"),
                             strict_enforce=bool(strict_enforce),
-                            motion_enabled=bool(st.session_state.get("use_ai_imgs", False)) is False and True,
+                            motion_enabled=True,
                         )
                         st.session_state["video_path"] = str(video_path)
                         st.session_state["srt_path"] = str(srt_path)
@@ -1350,12 +1351,26 @@ def prompts_from_script_chunks(chunks: List[str], style: str = "cartoon, vibrant
 
 def openai_generate_image(prompt: str, out_path: Path, size: str = "1280x720") -> Path:
     model = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
-    resp = client.images.generate(model=model, prompt=prompt, size=size)
-    b64 = resp.data[0].b64_json
+    # Stream small size first for memory safety; upscale with Pillow if needed
+    small_size = os.getenv("OPENAI_IMAGE_SMALL", "512x288")
+    try:
+        resp = client.images.generate(model=model, prompt=prompt, size=small_size)
+        b64 = resp.data[0].b64_json
+    except Exception:
+        # fallback to default size if small not supported
+        resp = client.images.generate(model=model, prompt=prompt, size=size)
+        b64 = resp.data[0].b64_json
     import base64
     data = base64.b64decode(b64)
     with open(out_path, "wb") as f:
         f.write(data)
+    # If generated small, upscale to target with Pillow (low memory)
+    try:
+        with Image.open(out_path) as im:
+            im = im.convert("RGB").resize(tuple(map(int, size.split("x"))), Image.LANCZOS)
+            im.save(out_path, quality=92, optimize=True)
+    except Exception:
+        pass
     return out_path
 
 
@@ -1365,12 +1380,15 @@ def generate_cartoon_images_from_script(script_text: str, temp_dir: Path, max_im
     prompts = prompts_from_script_chunks(chunks)
     paths: List[Path] = []
     for i, p in enumerate(prompts, 1):
-        path = temp_dir / f"ai_img_{i:02d}.png"
+        path = temp_dir / f"ai_img_{i:02d}.jpg"
         try:
             openai_generate_image(p, path, size="1280x720")
             paths.append(path)
         except Exception as e:
             print("AI image generation failed:", e)
+        finally:
+            if i % 2 == 0:
+                gc.collect()
     return paths
 
 
