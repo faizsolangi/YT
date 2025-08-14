@@ -1107,6 +1107,81 @@ def find_trending_keyword(
     return best_kw, best_data, float(best_score)
 
 
+# Move AI image helper functions here so they are defined before usage in the UI
+
+def chunk_script_for_images(text: str, max_chunks: int = 8) -> List[str]:
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    sentences = [s.strip() for s in sentences if s.strip()]
+    if not sentences:
+        return []
+    chunks: List[str] = []
+    cur = ""
+    for s in sentences:
+        if len(cur) + len(s) + 1 <= 180:
+            cur = (cur + " " + s).strip()
+        else:
+            if cur:
+                chunks.append(cur)
+            cur = s
+        if len(chunks) >= max_chunks:
+            break
+    if cur and len(chunks) < max_chunks:
+        chunks.append(cur)
+    return chunks
+
+
+def prompts_from_script_chunks(chunks: List[str], style: str = "cartoon, vibrant, friendly, flat shading") -> List[str]:
+    prompts: List[str] = []
+    for i, ch in enumerate(chunks, 1):
+        prompts.append(
+            f"Illustration, {style}. Scene {i}: {ch}. Clear composition, single focal subject, no text, 16:9."
+        )
+    return prompts
+
+
+def openai_generate_image(prompt: str, out_path: Path, size: str = "1280x720") -> Path:
+    model = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
+    # Stream small size first for memory safety; upscale with Pillow if needed
+    small_size = os.getenv("OPENAI_IMAGE_SMALL", "512x288")
+    try:
+        resp = client.images.generate(model=model, prompt=prompt, size=small_size)
+        b64 = resp.data[0].b64_json
+    except Exception:
+        # fallback to default size if small not supported
+        resp = client.images.generate(model=model, prompt=prompt, size=size)
+        b64 = resp.data[0].b64_json
+    import base64
+    data = base64.b64decode(b64)
+    with open(out_path, "wb") as f:
+        f.write(data)
+    # If generated small, upscale to target with Pillow (low memory)
+    try:
+        with Image.open(out_path) as im:
+            im = im.convert("RGB").resize(tuple(map(int, size.split("x"))), Image.LANCZOS)
+            im.save(out_path, quality=92, optimize=True)
+    except Exception:
+        pass
+    return out_path
+
+
+def generate_cartoon_images_from_script(script_text: str, temp_dir: Path, max_images: int = 8) -> List[Path]:
+    cleaned = clean_script_for_tts(script_text)
+    chunks = chunk_script_for_images(cleaned, max_chunks=max_images)
+    prompts = prompts_from_script_chunks(chunks)
+    paths: List[Path] = []
+    for i, p in enumerate(prompts, 1):
+        path = temp_dir / f"ai_img_{i:02d}.jpg"
+        try:
+            openai_generate_image(p, path, size="1280x720")
+            paths.append(path)
+        except Exception as e:
+            print("AI image generation failed:", e)
+        finally:
+            if i % 2 == 0:
+                gc.collect()
+    return paths
+
+
 # -------------------------
 # Streamlit UI
 # -------------------------
@@ -1410,79 +1485,6 @@ if "video_path" in st.session_state or "audio_path" in st.session_state or "thum
 st.caption(
     "Notes: This app generates SEO metadata with AI. MoviePy usage avoids editor/vfx modules for compatibility."
 )
-
-
-def chunk_script_for_images(text: str, max_chunks: int = 8) -> List[str]:
-    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
-    sentences = [s.strip() for s in sentences if s.strip()]
-    if not sentences:
-        return []
-    chunks: List[str] = []
-    cur = ""
-    for s in sentences:
-        if len(cur) + len(s) + 1 <= 180:
-            cur = (cur + " " + s).strip()
-        else:
-            if cur:
-                chunks.append(cur)
-            cur = s
-        if len(chunks) >= max_chunks:
-            break
-    if cur and len(chunks) < max_chunks:
-        chunks.append(cur)
-    return chunks
-
-
-def prompts_from_script_chunks(chunks: List[str], style: str = "cartoon, vibrant, friendly, flat shading") -> List[str]:
-    prompts: List[str] = []
-    for i, ch in enumerate(chunks, 1):
-        prompts.append(
-            f"Illustration, {style}. Scene {i}: {ch}. Clear composition, single focal subject, no text, 16:9."
-        )
-    return prompts
-
-
-def openai_generate_image(prompt: str, out_path: Path, size: str = "1280x720") -> Path:
-    model = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
-    # Stream small size first for memory safety; upscale with Pillow if needed
-    small_size = os.getenv("OPENAI_IMAGE_SMALL", "512x288")
-    try:
-        resp = client.images.generate(model=model, prompt=prompt, size=small_size)
-        b64 = resp.data[0].b64_json
-    except Exception:
-        # fallback to default size if small not supported
-        resp = client.images.generate(model=model, prompt=prompt, size=size)
-        b64 = resp.data[0].b64_json
-    import base64
-    data = base64.b64decode(b64)
-    with open(out_path, "wb") as f:
-        f.write(data)
-    # If generated small, upscale to target with Pillow (low memory)
-    try:
-        with Image.open(out_path) as im:
-            im = im.convert("RGB").resize(tuple(map(int, size.split("x"))), Image.LANCZOS)
-            im.save(out_path, quality=92, optimize=True)
-    except Exception:
-        pass
-    return out_path
-
-
-def generate_cartoon_images_from_script(script_text: str, temp_dir: Path, max_images: int = 8) -> List[Path]:
-    cleaned = clean_script_for_tts(script_text)
-    chunks = chunk_script_for_images(cleaned, max_chunks=max_images)
-    prompts = prompts_from_script_chunks(chunks)
-    paths: List[Path] = []
-    for i, p in enumerate(prompts, 1):
-        path = temp_dir / f"ai_img_{i:02d}.jpg"
-        try:
-            openai_generate_image(p, path, size="1280x720")
-            paths.append(path)
-        except Exception as e:
-            print("AI image generation failed:", e)
-        finally:
-            if i % 2 == 0:
-                gc.collect()
-    return paths
 
 
 def ken_burns_frames(img: np.ndarray, width: int, height: int, duration: float, fps: int = 12,
