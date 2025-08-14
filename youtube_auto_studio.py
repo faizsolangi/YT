@@ -651,15 +651,24 @@ def build_video_from_script_and_images(
         final_audio = AudioArrayClip(arr, fps=fps)
         write_srt(srt_entries, srt_path)
 
-    # Download images
+    # Resolve image sources (local paths or URLs)
     image_files: List[Path] = []
-    for i, url in enumerate(image_urls):
+    for i, src in enumerate(image_urls):
         try:
-            img_path = tmpdir / f"img_{i}.jpg"
-            download_image(url, img_path)
-            image_files.append(img_path)
+            src_str = str(src)
+            local_path = Path(src_str)
+            if local_path.exists():
+                image_files.append(local_path)
+            elif src_str.startswith("http://") or src_str.startswith("https://"):
+                img_path = tmpdir / f"img_{i}.jpg"
+                download_image(src_str, img_path)
+                image_files.append(img_path)
+            else:
+                img_path = tmpdir / f"img_{i}.jpg"
+                download_image(src_str, img_path)
+                image_files.append(img_path)
         except Exception as e:
-            print("Image download failed:", e)
+            print("Image source failed:", src, e)
     if not image_files:
         raise RuntimeError("No images to build video.")
 
@@ -1143,12 +1152,17 @@ def openai_generate_image(prompt: str, out_path: Path, size: str = "1280x720") -
     model = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
     # Stream small size first for memory safety; upscale with Pillow if needed
     small_size = os.getenv("OPENAI_IMAGE_SMALL", "512x288")
+    b64 = None
     try:
         resp = client.images.generate(model=model, prompt=prompt, size=small_size)
+        if not resp or not getattr(resp, "data", None) or not getattr(resp.data[0], "b64_json", None):
+            raise RuntimeError("empty_image_response")
         b64 = resp.data[0].b64_json
     except Exception:
-        # fallback to default size if small not supported
+        # fallback to default size if small not supported or previous call empty
         resp = client.images.generate(model=model, prompt=prompt, size=size)
+        if not resp or not getattr(resp, "data", None) or not getattr(resp.data[0], "b64_json", None):
+            raise RuntimeError("image_generation_failed")
         b64 = resp.data[0].b64_json
     import base64
     data = base64.b64decode(b64)
