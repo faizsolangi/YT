@@ -33,6 +33,7 @@ from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")  # optional, for stock images
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # optional, for AI image fallback
 
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
@@ -1178,6 +1179,63 @@ def openai_generate_image(prompt: str, out_path: Path, size: str = "1280x720") -
     return out_path
 
 
+def gemini_generate_image(prompt: str, out_path: Path, size: str = "1280x720") -> Path:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("gemini_api_key_missing")
+    # Use Google Generative AI Images API (v1beta) via REST
+    # Endpoint: https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateImage
+    # Note: Some environments may need to use alternate SDK; keeping to REST to avoid extra deps.
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateImage"
+    headers = {"Content-Type": "application/json"}
+    params = {"key": GEMINI_API_KEY}
+    body = {
+        "prompt": {
+            "text": prompt
+        },
+        "imageFormat": "JPEG",
+        "mimeType": "image/jpeg",
+        "size": size
+    }
+    try:
+        resp = requests.post(url, headers=headers, params=params, json=body, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        # Expected field: images[0].data (base64) or candidates[0].content.parts[0].inline_data.data
+        b64_data = None
+        if isinstance(data, dict):
+            if "images" in data and data["images"]:
+                b64_data = data["images"][0].get("data")
+            elif "candidates" in data and data["candidates"]:
+                parts = (((data["candidates"][0] or {}).get("content") or {}).get("parts") or [])
+                if parts and isinstance(parts[0], dict):
+                    inline = parts[0].get("inline_data") or {}
+                    b64_data = inline.get("data")
+        if not b64_data:
+            raise RuntimeError("gemini_empty_image_response")
+        import base64
+        raw = base64.b64decode(b64_data)
+        with open(out_path, "wb") as f:
+            f.write(raw)
+        try:
+            with Image.open(out_path) as im:
+                im = im.convert("RGB").resize(tuple(map(int, size.split("x"))), Image.LANCZOS)
+                im.save(out_path, quality=92, optimize=True)
+        except Exception:
+            pass
+        return out_path
+    except Exception as e:
+        raise RuntimeError(f"gemini_image_generation_failed: {e}")
+
+
+def ai_generate_image_with_fallback(prompt: str, out_path: Path, size: str = "1280x720") -> Path:
+    # Try OpenAI first, then Gemini
+    try:
+        return openai_generate_image(prompt, out_path, size=size)
+    except Exception:
+        pass
+    return gemini_generate_image(prompt, out_path, size=size)
+
+
 def generate_cartoon_images_from_script(script_text: str, temp_dir: Path, max_images: int = 8) -> List[Path]:
     cleaned = clean_script_for_tts(script_text)
     chunks = chunk_script_for_images(cleaned, max_chunks=max_images)
@@ -1186,7 +1244,7 @@ def generate_cartoon_images_from_script(script_text: str, temp_dir: Path, max_im
     for i, p in enumerate(prompts, 1):
         path = temp_dir / f"ai_img_{i:02d}.jpg"
         try:
-            openai_generate_image(p, path, size="1280x720")
+            ai_generate_image_with_fallback(p, path, size="1280x720")
             paths.append(path)
         except Exception as e:
             print("AI image generation failed:", e)
@@ -1205,7 +1263,7 @@ st.title("YouTube Auto Studio — Trends → Topic → Script → Video → SEO 
 
 with st.sidebar:
     st.header("Config")
-    st.write("Ensure env vars:\n- OPENAI_API_KEY\n- YOUTUBE_API_KEY\n(optional) PEXELS_API_KEY\n(optional) AWS_ACCESS_KEY_ID/SECRET, S3_BUCKET_NAME")
+    st.write("Ensure env vars:\n- OPENAI_API_KEY\n- YOUTUBE_API_KEY\n(optional) PEXELS_API_KEY\n(optional) GEMINI_API_KEY\n(optional) AWS_ACCESS_KEY_ID/SECRET, S3_BUCKET_NAME")
     st.write("Note: App builds videos and can upload to S3 for public links.")
     safety_mode = st.checkbox("Safety mode (require LLM SAFE + creativeCommons)", value=True)
     prefer_cc = st.checkbox("Prefer Creative Commons in search", value=False)
