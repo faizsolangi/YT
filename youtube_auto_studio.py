@@ -1152,7 +1152,8 @@ def prompts_from_script_chunks(chunks: List[str], style: str = "cartoon, vibrant
 def openai_generate_image(prompt: str, out_path: Path, size: str = "1280x720") -> Path:
     model = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
     # Stream small size first for memory safety; upscale with Pillow if needed
-    small_size = os.getenv("OPENAI_IMAGE_SMALL", "512x288")
+    small_size = os.getenv("OPENAI_IMAGE_SMALL", "512x512")
+    api_size = os.getenv("OPENAI_IMAGE_SIZE", "1024x1024")
     b64 = None
     try:
         resp = client.images.generate(model=model, prompt=prompt, size=small_size)
@@ -1161,10 +1162,26 @@ def openai_generate_image(prompt: str, out_path: Path, size: str = "1280x720") -
         b64 = resp.data[0].b64_json
     except Exception:
         # fallback to default size if small not supported or previous call empty
-        resp = client.images.generate(model=model, prompt=prompt, size=size)
+        resp = client.images.generate(model=model, prompt=prompt, size=api_size)
         if not resp or not getattr(resp, "data", None) or not getattr(resp.data[0], "b64_json", None):
-            raise RuntimeError("image_generation_failed")
-        b64 = resp.data[0].b64_json
+            # last resort: direct REST call to images/generations
+            try:
+                api_key = os.getenv("OPENAI_API_KEY")
+                if not api_key:
+                    raise RuntimeError("missing_openai_api_key")
+                url = "https://api.openai.com/v1/images/generations"
+                headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+                body = {"model": model, "prompt": prompt, "size": api_size}
+                r = requests.post(url, headers=headers, json=body, timeout=60)
+                r.raise_for_status()
+                j = r.json()
+                if not j.get("data") or not j["data"][0].get("b64_json"):
+                    raise RuntimeError("rest_images_generations_empty")
+                b64 = j["data"][0]["b64_json"]
+            except Exception as rest_e:
+                raise RuntimeError(f"image_generation_failed: {rest_e}")
+        else:
+            b64 = resp.data[0].b64_json
     import base64
     data = base64.b64decode(b64)
     with open(out_path, "wb") as f:
@@ -1227,13 +1244,19 @@ def gemini_generate_image(prompt: str, out_path: Path, size: str = "1280x720") -
         raise RuntimeError(f"gemini_image_generation_failed: {e}")
 
 
-def ai_generate_image_with_fallback(prompt: str, out_path: Path, size: str = "1280x720") -> Path:
-    # Try OpenAI first, then Gemini
+def ai_generate_image_with_fallback(prompt: str, out_path: Path, size: str = "1280x720") -> Tuple[Optional[Path], Optional[str]]:
+    # Try OpenAI first, then Gemini; return (path, reason_if_failed)
     try:
-        return openai_generate_image(prompt, out_path, size=size)
-    except Exception:
-        pass
-    return gemini_generate_image(prompt, out_path, size=size)
+        p = openai_generate_image(prompt, out_path, size=size)
+        return p, None
+    except Exception as e1:
+        reason_openai = f"openai_failed: {e1}"
+        try:
+            p = gemini_generate_image(prompt, out_path, size=size)
+            return p, None
+        except Exception as e2:
+            reason = f"{reason_openai}; gemini_failed: {e2}"
+            return None, reason
 
 
 def generate_cartoon_images_from_script(script_text: str, temp_dir: Path, max_images: int = 8) -> List[Path]:
@@ -1244,8 +1267,11 @@ def generate_cartoon_images_from_script(script_text: str, temp_dir: Path, max_im
     for i, p in enumerate(prompts, 1):
         path = temp_dir / f"ai_img_{i:02d}.jpg"
         try:
-            ai_generate_image_with_fallback(p, path, size="1280x720")
-            paths.append(path)
+            result_path, reason = ai_generate_image_with_fallback(p, path, size="1280x720")
+            if result_path:
+                paths.append(result_path)
+            else:
+                print("AI image generation failed for scene", i, "reason:", reason)
         except Exception as e:
             print("AI image generation failed:", e)
         finally:
@@ -1486,7 +1512,14 @@ if "script" in st.session_state:
                             ai_images = generate_cartoon_images_from_script(st.session_state["script"], tmpdir, max_images=min(int(num_images), 6))
                             images = [str(p) for p in ai_images]
                             if not images:
-                                st.warning("AI image generation failed; falling back to Pexels.")
+                                warn_reason = "OpenAI and Gemini both failed to generate images."
+                                if not os.getenv("OPENAI_IMAGE_MODEL"):
+                                    warn_reason += " Missing OPENAI_IMAGE_MODEL."
+                                if not os.getenv("OPENAI_API_KEY"):
+                                    warn_reason += " Missing OPENAI_API_KEY."
+                                if not os.getenv("GEMINI_API_KEY"):
+                                    warn_reason += " Missing GEMINI_API_KEY."
+                                st.warning(f"AI image generation failed; falling back to Pexels. Reason: {warn_reason}")
                                 images = pexels_search_images(niche, per_page=int(num_images))
                         else:
                             images = pexels_search_images(niche, per_page=int(num_images))
