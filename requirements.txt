@@ -3,3 +3,4 @@ openai==1.30.0
 websocket-client==1.6.1
 python-dotenv==1.0.0
 pytz==2023.3
+google-auth-oauthlib==1.0.0
