@@ -4,4 +4,5 @@ websocket-client==1.6.1
 python-dotenv==1.0.0
 pytz==2023.3
 google-auth-oauthlib==1.0.0
-obsws-python==1.0.0
+obsws-python==1.8.0
+
